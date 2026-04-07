@@ -103,7 +103,19 @@ class AnthropicClient(LLMClientBase):
         result = []
         for tool in tools:
             if isinstance(tool, dict):
-                result.append(tool)
+                # If already in OpenAI function tool format, convert to Anthropic.
+                if tool.get("type") == "function" and "function" in tool:
+                    function = tool["function"]
+                    result.append(
+                        {
+                            "name": function["name"],
+                            "description": function.get("description", ""),
+                            "input_schema": function["parameters"],
+                        }
+                    )
+                else:
+                    # Assume it's already in Anthropic format.
+                    result.append(tool)
             elif hasattr(tool, "to_schema"):
                 # Tool object with to_schema method
                 result.append(tool.to_schema())
