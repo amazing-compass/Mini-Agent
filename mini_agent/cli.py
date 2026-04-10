@@ -35,7 +35,7 @@ from mini_agent.tools.base import Tool
 from mini_agent.tools.bash_tool import BashKillTool, BashOutputTool, BashTool
 from mini_agent.tools.file_tools import EditTool, ReadTool, WriteTool
 from mini_agent.tools.mcp_loader import cleanup_mcp_connections, load_mcp_tools_async, set_mcp_timeout_config
-from mini_agent.tools.note_tool import SessionNoteTool
+from mini_agent.tools.note_tool import RecallNoteTool, SessionNoteTool
 from mini_agent.tools.skill_tool import create_skill_tools
 from mini_agent.utils import calculate_display_width
 
@@ -74,12 +74,12 @@ class Colors:
     BG_YELLOW = "\033[43m"
     BG_BLUE = "\033[44m"
 
-
+# 1️⃣1️⃣ 返回日志目录 ✅
 def get_log_directory() -> Path:
     """Get the log directory path."""
     return Path.home() / ".mini-agent" / "log"
 
-
+# 1️⃣12️⃣ 列出日志目录最新 10 个文件    ✅
 def show_log_directory(open_file_manager: bool = True) -> None:
     """Show log directory contents and optionally open file manager.
 
@@ -94,7 +94,7 @@ def show_log_directory(open_file_manager: bool = True) -> None:
         print(f"{Colors.RED}Log directory does not exist: {log_dir}{Colors.RESET}\n")
         return
 
-    log_files = list(log_dir.glob("*.log"))
+    log_files = list(log_dir.glob("*.log"))       # glob 是 Path 对象的方法 -- 用来按模式匹配文件
 
     if not log_files:
         print(f"{Colors.YELLOW}No log files found in directory.{Colors.RESET}\n")
@@ -124,7 +124,7 @@ def show_log_directory(open_file_manager: bool = True) -> None:
 
     print()
 
-
+# 1️⃣3️⃣ 跨平台打开文件管理器    ✅
 def _open_directory_in_file_manager(directory: Path) -> None:
     """Open directory in system file manager (cross-platform)."""
     system = platform.system()
@@ -141,7 +141,7 @@ def _open_directory_in_file_manager(directory: Path) -> None:
     except Exception as e:
         print(f"{Colors.YELLOW}Error opening file manager: {e}{Colors.RESET}")
 
-
+# 1️⃣4️⃣ 读取并打印指定日志文件内容 ✅
 def read_log_file(filename: str) -> None:
     """Read and display a specific log file.
 
@@ -167,7 +167,7 @@ def read_log_file(filename: str) -> None:
     except Exception as e:
         print(f"\n{Colors.RED}❌ Error reading file: {e}{Colors.RESET}\n")
 
-
+# 7️⃣ 打印欢迎横幅、帮助信息、会话信息和统计信息 ✅
 def print_banner():
     """Print welcome banner with proper alignment"""
     BOX_WIDTH = 58
@@ -187,7 +187,7 @@ def print_banner():
     print(f"{Colors.BOLD}{Colors.BRIGHT_CYAN}╚{'═' * BOX_WIDTH}╝{Colors.RESET}")
     print()
 
-
+# 9️⃣ 打印所有可用命令和快捷说明
 def print_help():
     """Print help information"""
     help_text = f"""
@@ -219,7 +219,7 @@ def print_help():
 """
     print(help_text)
 
-
+# 8️⃣ 打印会话信息和统计信息  ✅
 def print_session_info(agent: Agent, workspace_dir: Path, model: str):
     """Print session information with proper alignment"""
     BOX_WIDTH = 58
@@ -257,7 +257,7 @@ def print_session_info(agent: Agent, workspace_dir: Path, model: str):
     print(f"{Colors.DIM}Type {Colors.BRIGHT_GREEN}/help{Colors.DIM} for help, {Colors.BRIGHT_GREEN}/exit{Colors.DIM} to quit{Colors.RESET}")
     print()
 
-
+# 1️⃣0️⃣ 打印session统计 -- 退出时调用 ✅
 def print_stats(agent: Agent, session_start: datetime):
     """Print session statistics"""
     duration = datetime.now() - session_start
@@ -281,13 +281,14 @@ def print_stats(agent: Agent, session_start: datetime):
         print(f"  API Tokens Used: {Colors.BRIGHT_MAGENTA}{agent.api_total_tokens:,}{Colors.RESET}")
     print(f"{Colors.DIM}{'─' * 40}{Colors.RESET}\n")
 
-
+# 2️⃣ 定义并解析CLI参数 ✅
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments
 
     Returns:
         Parsed arguments
     """
+    # ArgumentParser 是 Python 内置工具 --- 专门用来处理命令行参数
     parser = argparse.ArgumentParser(
         description="Mini Agent - AI assistant with file tools and MCP support",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -299,6 +300,7 @@ Examples:
   mini-agent log agent_run_xxx.log        # Read a specific log file
         """,
     )
+    # 声明三个参数 --workspace/-w、--task/-t、--version/-v
     parser.add_argument(
         "--workspace",
         "-w",
@@ -334,7 +336,7 @@ Examples:
 
     return parser.parse_args()
 
-
+# 4️⃣ 异步函数 -- 加载与工作目录无关的工具 -- Bash 辅助工具、Skill、MCP 工具
 async def initialize_base_tools(config: Config):
     """Initialize base tools (independent of workspace)
 
@@ -430,7 +432,7 @@ async def initialize_base_tools(config: Config):
     print()  # Empty line separator
     return tools, skill_loader
 
-
+# 5️⃣ 加载需要知道工作目录的工具 -- BashTool、FileTools、SessionNoteTool ✅
 def add_workspace_tools(tools: List[Tool], config: Config, workspace_dir: Path):
     """Add workspace-dependent tools
 
@@ -463,10 +465,13 @@ def add_workspace_tools(tools: List[Tool], config: Config, workspace_dir: Path):
 
     # Session note tool - needs workspace to store memory file
     if config.tools.enable_note:
-        tools.append(SessionNoteTool(memory_file=str(workspace_dir / ".agent_memory.json")))
+        tools.extend([
+            SessionNoteTool(memory_file=str(workspace_dir / ".agent_memory.json")),
+            RecallNoteTool(memory_file=str(workspace_dir / ".agent_memory.json")),
+        ])
         print(f"{Colors.GREEN}✅ Loaded session note tool{Colors.RESET}")
 
-
+# 6️⃣ 程序退出之前清理 MCP 连接 -- 同时压制 asyncio 在 teardown 时打印的噪音报错
 async def _quiet_cleanup():
     """Clean up MCP connections, suppressing noisy asyncgen teardown tracebacks."""
     # Silence the asyncgen finalization noise that anyio/mcp emits when
@@ -482,7 +487,13 @@ async def _quiet_cleanup():
     except Exception:
         pass
 
-
+# 3️⃣ agent 运行主体
+# 1. 加载配置、初始化 LLM 客户端
+# 2. 调用 initialize_base_tools() 和 add_workspace_tools() 装载工具
+# 3. 加载 system prompt
+# 4. 创建 Agent 实例
+# 5. 非交互模式 -- 直接跑任务然后退出
+# 6. 交互模式 -- 构建 prompt_toolkit session -- 进入主循环 -- 处理用户输入和 Esc 取消
 async def run_agent(workspace_dir: Path, task: str = None):
     """Run Agent in interactive or non-interactive mode.
 
@@ -574,7 +585,7 @@ async def run_agent(workspace_dir: Path, task: str = None):
     # 3. Initialize base tools (independent of workspace)
     tools, skill_loader = await initialize_base_tools(config)
 
-    # 4. Add workspace-dependent tools
+    # 4. Add workspace-dependent tools 
     add_workspace_tools(tools, config, workspace_dir)
 
     # 5. Load System Prompt (with priority search)
@@ -841,6 +852,7 @@ async def run_agent(workspace_dir: Path, task: str = None):
     await _quiet_cleanup()
 
 
+# 1️⃣  ✅
 def main():
     """Main entry point for CLI"""
     # Parse command line arguments

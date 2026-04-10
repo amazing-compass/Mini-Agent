@@ -79,7 +79,7 @@ class Config(BaseModel):
         return cls.from_yaml(config_path)
 
     @classmethod
-    def from_yaml(cls, config_path: str | Path) -> "Config":
+    def from_yaml(cls, config_path: str | Path) -> "Config":      # 这里的 "Config" --- 是向前引用 --- 因为 from_yaml 是 Config 类内部函数 -- 直接 —> Config 会报错 Config 未定义
         """Load configuration from YAML file
 
         Args:
@@ -162,6 +162,7 @@ class Config(BaseModel):
             agent=agent_config,
             tools=tools_config,
         )
+    # staticmethod --- 跟类/实例 都没有关系 --- 只是逻辑上归属于这个类
 
     @staticmethod
     def get_package_dir() -> Path:
