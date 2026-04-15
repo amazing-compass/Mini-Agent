@@ -40,9 +40,61 @@
 ### 1.2 L2 — 截断旧 read_file 结果
 
 - **时机**：L1 之后仍超限时
-- **操作**：N 轮之前的 `name == "read_file"` 的 tool 消息，content 替换为 `[Previous read_file: {从 arguments 提取的路径}]`
+- **操作**：N 轮之前的 `name == "read_file"` 的 tool 消息，content 替换为 `[Previous read_file: {文件路径}]`
 - **成本**：FREE（原文件在磁盘，LLM 需要时重新 read_file）
 - **新方法**：`_truncate_old_readfile_results(self, keep_recent_n: int = 3)`
+
+#### ⚠️ 路径提取问题
+
+当前 tool 消息（`agent.py:495-500`）构造时**不保存 arguments**，Message schema（`schema.py:29-37`）也没有 arguments 字段。文件路径只存在于前面 assistant 消息的 `tool_calls[].function.arguments` 里。
+
+**解法：通过 `tool_call_id` 回查参数（不改 schema）**
+
+运行链路中天然保留了关联：assistant 消息有 `tool_calls`（含完整参数），tool 消息有 `tool_call_id`。先建索引，再取参数：
+
+```python
+def _build_tool_call_args_index(self) -> dict[str, dict]:
+    """构建 tool_call_id → arguments 的索引"""
+    index = {}
+    for msg in self.messages:
+        if msg.role == "assistant" and msg.tool_calls:
+            for tc in msg.tool_calls:
+                index[tc.id] = tc.function.arguments
+    return index
+```
+
+L2 截断时，用索引取参数，生成带路径的占位符：
+
+```python
+args_index = self._build_tool_call_args_index()
+
+for msg in old_tool_messages:
+    if msg.name == "read_file" and msg.tool_call_id:
+        args = args_index.get(msg.tool_call_id, {})
+        path = args.get("file_path", "unknown")
+        # 保留 offset/limit 信息，让 LLM 知道是整文件还是局部读取
+        offset = args.get("offset")
+        limit = args.get("limit")
+        if offset or limit:
+            params = ", ".join(f"{k}={v}" for k, v in [("offset", offset), ("limit", limit)] if v)
+            msg.content = f"[Previous read_file: {path} ({params})]"
+        else:
+            msg.content = f"[Previous read_file: {path}]"
+```
+
+占位符示例：
+- `[Previous read_file: mini_agent/agent.py]` — 整文件读取
+- `[Previous read_file: mini_agent/agent.py (offset=120, limit=80)]` — 局部读取
+
+回查失败时降级为 `[Previous read_file: unknown]`。
+
+**为什么不扩展 Message schema 存 arguments**：
+- 回查已经能解决问题，不需要先改 schema
+- 不会把参数在 assistant 和 tool 两处重复存储
+- 不引入额外协议层负担
+- 如果后续需要更通用的 compaction/recall/replay，再考虑给 Message 加内部字段
+
+**注意**：L1 的截断标记 `[Previous {name} executed successfully]` 只用 `msg.name`，不需要 arguments，不受此问题影响。
 
 ### 1.3 L4 — 全量压缩（保留最近 N 轮）
 
@@ -203,7 +255,145 @@ if config.tools.enable_note:
 
 1. **L1 测试**：构造超过 token_limit 的消息历史，包含多轮 bash/ls tool 结果。触发压缩后检查旧 tool 结果被替换为 `[Previous ...]`，最近 N 轮保持原样。
 2. **L2 测试**：L1 后仍超限，检查旧 read_file 结果也被截断。
-3. **L4 测试**：L1+L2 后仍超限，检查最终 messages 变为 `[system, summary_message, ...最近 N 轮 messages]`，summary_message 包含旧 user prompts + 结构化 LLM 摘要。
+3. **L4 测试**：L1+L2 后仍超限，检查最终 messages 变为 `[system, 合并消息]`，合并消息包含所有 user prompt + LLM 摘要。
 4. **Pinned 测试**：调用 record_note → 检查 messages[0].content 包含 note 内容 → 触发 L4 压缩 → 检查 note 仍在 messages[0] 中。
 5. **跨 session 测试**：记录 note → 退出 → 重启 → 检查 notes 自动加载到 system prompt。
 6. **运行实际任务**：启动 CLI，给一个需要多步工具调用的任务，观察压缩行为。
+
+---
+
+## 附录：Codex 提出的架构级重构方案（待评估）
+
+> 以下是 Codex 建议的更彻底的方案。核心思想：**把"内部存储"和"API 发送"拆开**，不再让 `self.messages` 身兼两职。目前仅作记录，尚未决定是否采纳。
+
+### 问题根源
+
+当前 `self.messages: list[Message]` 同时承担两个职责：
+1. **内部存储**：agent.py 用来记录所有历史、做压缩
+2. **API 输入**：直接传给 LLM client 发请求
+
+这导致所有内部概念（summary、pinned notes）都必须塞进 `Message(role=???)` 里，而 API 只认 `system/user/assistant/tool` 四种 role。于是：
+- summary 用 `role="user"` → 可能导致连续 user，Anthropic 不兼容
+- summary 塞进 system prompt → system prompt 膨胀且不可压缩
+- 插 dummy assistant → hack，不是根本解法
+
+### 方案：拆分内部存储 + 渲染层
+
+#### 新增数据结构
+
+```python
+class ContextSummary(BaseModel):
+    """L4 压缩产物，独立于 Message"""
+    covered_rounds: list[int]       # 覆盖了哪些轮次
+    user_goals: list[str]           # 用户原始 prompt（拼接保留）
+    completed_work: list[str]       # 已完成的工作
+    active_files: list[str]         # 活跃文件
+    key_findings: list[str]         # 关键发现
+    pending_todo: list[str]         # 待办事项
+    raw_text: str                   # 渲染后的文本（发给 API 用）
+```
+
+#### Agent 内部存储拆分
+
+```python
+# 现在：
+self.messages: list[Message]  # 一个列表管所有事
+
+# 改为：
+self.system_prompt: str                    # 固定的系统提示，不会膨胀
+self.pinned_notes: list[dict]              # 钉住的元信息
+self.cold_summaries: list[ContextSummary]  # L4 摘要（可以有多条）
+self.live_messages: list[Message]          # 最近 N 轮的原始消息
+```
+
+每一块有独立的生命周期和压缩策略：
+
+| 层 | 存储类型 | 压缩策略 | 上限控制 |
+|---|---------|---------|---------|
+| system_prompt | str | 不压缩 | 固定不变 |
+| pinned_notes | list[dict] | 超限丢旧的 | ~4000 字符 |
+| cold_summaries | list[ContextSummary] | 多条可合并/替换 | render 时控制 |
+| live_messages | list[Message] | L1/L2 截断 | 最近 N 轮 |
+
+#### 渲染层：render_for_provider()
+
+发送 API 请求前，把四块组装成合法的 message list：
+
+```python
+def render_for_provider(self) -> list[Message]:
+    """把内部存储组装成 API 合法的消息序列"""
+    result = []
+
+    # 1. System prompt（固定，不含 pinned notes 和 summary）
+    result.append(Message(role="system", content=self.system_prompt))
+
+    # 2. 上下文块：pinned notes + cold summaries → 合并成一条 user message
+    context_parts = []
+    if self.pinned_notes:
+        notes_text = "\n".join(f"- [{n['category']}] {n['content']}" for n in self.pinned_notes)
+        context_parts.append(f"## Pinned Context\n{notes_text}")
+    if self.cold_summaries:
+        # 多条 summary 合并成一段文本
+        merged = "\n\n".join(s.raw_text for s in self.cold_summaries)
+        context_parts.append(f"## Historical Summary\n{merged}")
+
+    if context_parts:
+        result.append(Message(role="user", content="\n\n".join(context_parts)))
+        # 插一条 assistant 保证 user/assistant 交替（兼容 Anthropic）
+        result.append(Message(role="assistant", content="Understood, continuing with the task."))
+
+    # 3. 最近 N 轮原始消息（原样）
+    result.extend(self.live_messages)
+
+    return result
+```
+
+#### 压缩逻辑变化
+
+```python
+async def _compress_context(self):
+    # token 估算：对 render_for_provider() 的结果估算
+    rendered = self.render_for_provider()
+    estimated = self._estimate_tokens_for(rendered)
+
+    if estimated <= self.token_limit:
+        return
+
+    # L1: 截断 live_messages 中的旧 tool 结果
+    self._truncate_old_tool_results(keep_recent_n=3)
+
+    # L2: 截断 live_messages 中的旧 read_file 结果
+    ...
+
+    # L4: live_messages 中 N 轮之前的部分 → 生成 ContextSummary → 存入 cold_summaries
+    #     live_messages 只保留最近 N 轮
+    old_messages = self.live_messages[:split_point]
+    self.live_messages = self.live_messages[split_point:]
+    new_summary = await self._create_context_summary(old_messages)
+    self.cold_summaries.append(new_summary)
+```
+
+#### LLM 调用改为使用 render 结果
+
+```python
+# 现在：
+response = await self.llm.generate(messages=self.messages, tools=tool_list)
+
+# 改为：
+rendered_messages = self.render_for_provider()
+response = await self.llm.generate(messages=rendered_messages, tools=tool_list)
+```
+
+### 这个方案解决了什么
+
+1. **summary 不需要 role** — 它是独立的 `ContextSummary` 对象，不是 Message
+2. **system prompt 不会膨胀** — pinned notes 和 summary 在 render 时组装，不塞进 system prompt
+3. **不会重复压缩 summary** — summary 在 `cold_summaries` 里，不在 `live_messages` 里，L1/L2/L4 只操作 `live_messages`
+4. **API 兼容** — render 层负责处理 role 交替等协议细节
+5. **多次 L4 不丢信息** — 每次 L4 产生一条新 ContextSummary 追加到 cold_summaries，旧的不会被再次摘要。render 时合并输出
+
+### 代价
+
+- **改动量大**：agent.py 围绕 `self.messages` 的所有逻辑都要改（token 估算、消息追加、日志记录、取消清理、/clear、/history 等）
+- **调试复杂度增加**：内部存储和实际发送内容不一致，排查问题时需要看 render 结果
+- **当前方案（Part 1 + Part 2）已经能用**：如果只用 MiniMax API，连续 user 不是问题，不一定需要这么大的重构
