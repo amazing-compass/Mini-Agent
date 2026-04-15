@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional
 from .base import Tool, ToolResult
 from .skill_loader import SkillLoader
 
-
+# Skill 系统对LLM暴露出来的工具类
 class GetSkillTool(Tool):
     """Tool to get detailed information about a specific skill"""
 
@@ -53,7 +53,11 @@ class GetSkillTool(Tool):
         result = skill.to_prompt()
         return ToolResult(success=True, content=result)
 
-
+# 工厂函数 
+# 1. 创建 SkillLoader
+# 2. 提前发现并加载所有 skills
+# 3. 创建 GetSkillTool
+# 4. 最后返回工具列表和 loader
 def create_skill_tools(
     skills_dir: str = "./skills",
 ) -> tuple[List[Tool], Optional[SkillLoader]]:

@@ -5,9 +5,9 @@ Supports loading skills from SKILL.md files and providing them to Agent
 """
 
 import re
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict, List, Optional
+from dataclasses import dataclass       # 装饰器 ---- 主要存储数据的类
+from pathlib import Path 
+from typing import Dict, List, Optional       # Optional 表示一个值可以是某个类型或者None
 
 import yaml
 
@@ -57,6 +57,8 @@ class SkillLoader:
         self.skills_dir = Path(skills_dir)
         self.loaded_skills: Dict[str, Skill] = {}
 
+    # ✅
+    # 读取单个SKILL.md文件 ---- 解析 YAML frontmatter -- 把正文内容做路径预处理 --- 然后构造 Skill 对象
     def load_skill(self, skill_path: Path) -> Optional[Skill]:
         """
         Load single skill from SKILL.md file
@@ -71,6 +73,11 @@ class SkillLoader:
             content = skill_path.read_text(encoding="utf-8")
 
             # Parse YAML frontmatter
+            # 把 SKILL.md 内容分成两部分 --- 1. 上面的 YAML frontmatter 2. 下面的技能内容
+            # re.match(pattern, string, flags) 
+            # pattern: 正则表达式模式
+            # string: 要匹配的字符串
+            # flags: 匹配模式 ---  re.DOTALL 让. 能匹配换行符 --- 默认.不匹配换行
             frontmatter_match = re.match(r"^---\n(.*?)\n---\n(.*)$", content, re.DOTALL)
 
             if not frontmatter_match:
@@ -82,7 +89,7 @@ class SkillLoader:
 
             # Parse YAML
             try:
-                frontmatter = yaml.safe_load(frontmatter_text)
+                frontmatter = yaml.safe_load(frontmatter_text)  # 把YAML文本解析成Python对象
             except yaml.YAMLError as e:
                 print(f"❌ Failed to parse YAML frontmatter: {e}")
                 return None
@@ -116,6 +123,8 @@ class SkillLoader:
             print(f"❌ Failed to load skill ({skill_path}): {e}")
             return None
 
+    # ✅
+    # 把 skill 正文里写的相对路径写成绝对路径
     def _process_skill_paths(self, content: str, skill_dir: Path) -> str:
         """
         Process skill content to replace relative paths with absolute paths.
@@ -132,6 +141,11 @@ class SkillLoader:
         """
         import re
 
+        # Match 对象     re.Match 对象是 re 模块中用于表示正则表达式匹配结果的对象。它包含了匹配的文本、位置等信息。通过 match.group() 方法可以获取匹配的文本内容。
+        # group() 方法     捕获组
+
+
+        # 1. 命令/行内代码中的路径
         # Pattern 1: Directory-based paths (scripts/, references/, assets/)
         # See https://agentskills.io/specification#optional-directories
         def replace_dir_path(match):
@@ -146,6 +160,7 @@ class SkillLoader:
         pattern_dirs = r"(python\s+|`)((?:scripts|references|assets)/[^\s`\)]+)"
         content = re.sub(pattern_dirs, replace_dir_path, content)
 
+        # 普通文本中提到的文档名
         # Pattern 2: Direct markdown/document references (forms.md, reference.md, etc.)
         # Matches phrases like "see reference.md" or "read forms.md"
         def replace_doc_path(match):
@@ -163,6 +178,7 @@ class SkillLoader:
         pattern_docs = r"(see|read|refer to|check)\s+([a-zA-Z0-9_-]+\.(?:md|txt|json|yaml))([.,;\s])"
         content = re.sub(pattern_docs, replace_doc_path, content, flags=re.IGNORECASE)
 
+        # 3. Markdown 链接里的路径
         # Pattern 3: Markdown links - supports multiple formats:
         # - [`filename.md`](filename.md) - simple filename
         # - [text](./reference/file.md) - relative path with ./
@@ -191,6 +207,7 @@ class SkillLoader:
 
         return content
 
+    # ✅
     def discover_skills(self) -> List[Skill]:
         """
         Discover and load all skills in the skills directory
@@ -204,6 +221,7 @@ class SkillLoader:
             print(f"⚠️  Skills directory does not exist: {self.skills_dir}")
             return skills
 
+        # rglob 递归查找符合某个模式的文件
         # Recursively find all SKILL.md files
         for skill_file in self.skills_dir.rglob("SKILL.md"):
             skill = self.load_skill(skill_file)
@@ -213,6 +231,7 @@ class SkillLoader:
 
         return skills
 
+    # ✅
     def get_skill(self, name: str) -> Optional[Skill]:
         """
         Get loaded skill
@@ -225,6 +244,7 @@ class SkillLoader:
         """
         return self.loaded_skills.get(name)
 
+    # ✅
     def list_skills(self) -> List[str]:
         """
         List all loaded skill names
@@ -234,10 +254,12 @@ class SkillLoader:
         """
         return list(self.loaded_skills.keys())
 
+    # ✅
     def get_skills_metadata_prompt(self) -> str:
         """
         Generate prompt containing ONLY metadata (name + description) for all skills.
         This implements Progressive Disclosure - Level 1.
+        Progressive Disclosure --- 渐进式披露
 
         Returns:
             Metadata-only prompt string

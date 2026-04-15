@@ -730,3 +730,57 @@ planner/todo/progress 将天然成为 pinned metadata 的重要来源：
 这项改进的本质，不是“把摘要做得更花”，而是：
 
 **把 `Mini-Agent` 从“有长上下文保护的 Demo”升级为“有上下文治理能力的 Agent Runtime”。**
+
+------- s06 总结
+
+s06 Context Compact 分析与业界对比
+s06 的三层架构回顾
+s06 采用了三层压缩管道：
+
+层级	触发时机	策略
+Layer 1: micro_compact	每轮静默执行	将旧 tool_result 替换为占位符，保留最近 3 个和 read_file 结果
+Layer 2: auto_compact	token > 50000 时	LLM 摘要，替换全部历史，原始记录存磁盘
+Layer 3: compact tool	模型主动调用	同 Layer 2，但由模型自主判断何时触发
+这是一个优秀的教学架构，清晰地展示了分层压缩的核心理念。但与生产级实现相比，有明显可改进之处。
+
+s06 的具体改进点
+1. Token 估算太粗糙（s06_context_compact.py:63-65）
+
+
+def estimate_tokens(messages: list) -> int:
+    return len(str(messages)) // 4  # 误差可达 30-50%
+改进：使用 tiktoken（OpenAI）或 Anthropic 的 count_tokens API 做精确计算
+Aider 默认用 Llama2 tokenizer 做保守估算，宁可高估也不低估
+2. 摘要后丢失了关键上下文（s06_context_compact.py:125-127）
+
+压缩后只剩一条 user 消息，没有保留最近的对话
+改进：像 Aider 那样保留最近 N 轮对话（tail），只压缩旧的部分
+3. 没有 tool_use/tool_result 配对保护
+
+如果在 auto_compact 边界处截断，可能破坏 tool 调用对
+OpenClaw 明确保证压缩边界不会拆分 tool 调用和返回
+4. 缺少压缩前的记忆持久化
+
+OpenClaw 在压缩前会提示 agent 先把关键信息写入磁盘文件
+这样即使摘要质量不好，关键信息也不会丢失
+5. 摘要质量没有验证
+
+完全依赖 LLM 一次性生成摘要，无校验机制
+Aider 使用递归分割：如果摘要+尾部仍然超限，最多递归 3 次继续压缩
+业界主流方案对比
+项目	策略	亮点
+Aider	递归 LLM 摘要	将消息分 head/tail，只摘要 head；超限时递归压缩最多 3 次；后台线程执行
+Cline	两级：文件读取去重 → 截断/LLM 摘要	先去重同一文件的多次读取；新版 auto-condense 摘要后自动重新读取最多 8 个关键文件
+OpenClaw	可插拔 context engine	插件式架构，支持 DAG 摘要、向量检索等自定义策略；压缩前 flush 记忆到磁盘；/compact "focus" 可引导摘要方向
+Opencode	Go 实现的 LLM 摘要	摘要聚焦四个维度：已完成操作、当前工作、修改文件、后续任务
+Continue	纯剪枝，无摘要	最简方案——从头部删除旧消息直到 fit，始终保留 system prompt 和最后一轮
+给你自己项目的建议
+如果你要为自己的 agent 实现 context compact，从 s06 出发可以做这些改进：
+
+保留尾部对话 — 压缩时只摘要前半部分，保留最近 N 轮完整对话（Aider 做法）
+精确 token 计算 — 用 tokenizer 替代 len//4
+压缩前持久化 — 在摘要前让 agent 把关键状态写入文件（OpenClaw 做法）
+文件读取去重 — 同一文件被多次读取时只保留最新一次（Cline 做法）
+摘要后重新加载关键文件 — Cline 的 auto-condense 会在摘要中识别 "Required Files" 并自动重新读取
+tool 配对保护 — 确保压缩边界不拆分 tool_use 和 tool_result
+这些改进可以按优先级逐步加入，其中 1（保留尾部）和 4（文件去重）投入产出比最高。

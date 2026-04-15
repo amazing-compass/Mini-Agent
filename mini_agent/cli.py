@@ -336,7 +336,7 @@ Examples:
 
     return parser.parse_args()
 
-# 4️⃣ 异步函数 -- 加载与工作目录无关的工具 -- Bash 辅助工具、Skill、MCP 工具
+# 4️⃣ 异步函数 -- 加载与工作目录无关的工具 -- Bash 辅助工具、Skill、MCP 工具  ✅
 async def initialize_base_tools(config: Config):
     """Initialize base tools (independent of workspace)
 
@@ -585,7 +585,7 @@ async def run_agent(workspace_dir: Path, task: str = None):
     # 3. Initialize base tools (independent of workspace)
     tools, skill_loader = await initialize_base_tools(config)
 
-    # 4. Add workspace-dependent tools 
+    # 4. Add workspace-dependent tools
     add_workspace_tools(tools, config, workspace_dir)
 
     # 5. Load System Prompt (with priority search)
@@ -640,14 +640,18 @@ async def run_agent(workspace_dir: Path, task: str = None):
         await _quiet_cleanup()
         return
 
+    # 把交互式命令行输入环境搭起来
+    # 为后面的 while true 循环准备一个好用的终端会话对象
     # 9. Setup prompt_toolkit session
     # Command completer
+    # WordCompleter 是 prompt_toolkit 提供的一个简单的单词补全工具 -- 用于交互式 CLI 的命令 自动补全
     command_completer = WordCompleter(
         ["/help", "/clear", "/history", "/stats", "/log", "/exit", "/quit", "/q"],
         ignore_case=True,
         sentence=True,
     )
 
+    # prompt_toolkit 库的样式创建方法
     # Custom style for prompt
     prompt_style = Style.from_dict(
         {
@@ -676,6 +680,7 @@ async def run_agent(workspace_dir: Path, task: str = None):
 
     # Create prompt session with history and auto-suggest
     # Use FileHistory for persistent history across sessions (stored in user's home directory)
+    # history 是所有交互式shell的标配功能 --- 比如 ↑ ↓ 可以浏览历史命令
     history_file = Path.home() / ".mini-agent" / ".history"
     history_file.parent.mkdir(parents=True, exist_ok=True)
     session = PromptSession(
@@ -685,8 +690,10 @@ async def run_agent(workspace_dir: Path, task: str = None):
         style=prompt_style,
         key_bindings=kb,
     )
+    # promptsession -- 是 prompt_toolkit 库中交互式提示符会话核心类 -- 封装了创建一个功能丰富的交互式命令行界面所需的所有组件
 
     # 10. Interactive loop
+    # 循环 -- 1. 读用户输入 -- 判断是命令还是普通对话 -- 如果是普通对话 运行 agent -- 回到下一轮继续等输入
     while True:
         try:
             # Get user input using prompt_toolkit
@@ -760,12 +767,22 @@ async def run_agent(workspace_dir: Path, task: str = None):
             )
             agent.add_user_message(user_input)
 
+            # 以下实现一种协作式取消机制
+            # 用户按 Esc
+            # 后台线程捕获案件
+            # 发出取消信号
+            # agent.run()  在合适的检查点看到这个信号
+            # 优雅退出当前轮执行
+            # 清理线程和状态
+
             # Create cancellation event
-            cancel_event = asyncio.Event()
+            cancel_event = asyncio.Event()     # asyncio.Event() --- 创建一个异步事件对象 用于在协程之间传递取消信号
             agent.cancel_event = cancel_event
 
             # Esc key listener thread
-            esc_listener_stop = threading.Event()
+            # threading.Event() --- 告诉监听线程 -- 现在可以停了 -- 这是给 Esc 监听线程用的
+            esc_listener_stop = threading.Event()    # threading.Event() -- 用于安全地在线程间传递"停止"信号
+            # esc_cancelled --- 线程和主协程共享的一个简单状态位
             esc_cancelled = [False]  # Mutable container for thread access
 
             def esc_key_listener():
@@ -793,11 +810,13 @@ async def run_agent(workspace_dir: Path, task: str = None):
                     import termios
                     import tty
 
-                    fd = sys.stdin.fileno()
-                    old_settings = termios.tcgetattr(fd)
+                    fd = sys.stdin.fileno()                        # 拿到终端文件描述符
+                    old_settings = termios.tcgetattr(fd)           # 保存当前终端设置
 
+                    # 把终端临时切成 按一个键就立刻能读到的模式
+                    # 然后每 0.05s 检查一次用户是否按 Esc
                     try:
-                        tty.setcbreak(fd)
+                        tty.setcbreak(fd)      # 把终端切到cbreak模式 --- cbreak模式 -- 不用等整行回车 -- 就能读到单个字符
                         while not esc_listener_stop.is_set():
                             rlist, _, _ = select.select([sys.stdin], [], [], 0.05)
                             if rlist:
@@ -808,11 +827,13 @@ async def run_agent(workspace_dir: Path, task: str = None):
                                     cancel_event.set()
                                     break
                     finally:
+                        # 恢复终端设置
                         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
                 except Exception:
                     pass
 
             # Start Esc listener thread
+            # 后台线程--- 专门监听键盘 esc 
             esc_thread = threading.Thread(target=esc_key_listener, daemon=True)
             esc_thread.start()
 
