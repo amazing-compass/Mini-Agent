@@ -115,7 +115,7 @@ class MiniMaxACPAgent:
                 return PromptResponse(stopReason="refusal")
         state.cancelled = False
         user_text = "\n".join(block.get("text", "") if isinstance(block, dict) else getattr(block, "text", "") for block in params.prompt)
-        state.agent.messages.append(Message(role="user", content=user_text))
+        state.agent.add_user_message(user_text)
         stop_reason = await self._run_turn(state, params.sessionId)
         return PromptResponse(stopReason=stop_reason)
 
@@ -131,7 +131,7 @@ class MiniMaxACPAgent:
                 return "cancelled"
             tool_schemas = [tool.to_schema() for tool in agent.tools.values()]
             try:
-                response = await agent.llm.generate(messages=agent.messages, tools=tool_schemas)
+                response = await agent.llm.generate(messages=agent.render_for_provider(), tools=tool_schemas)
             except Exception as exc:
                 logger.exception("LLM error")
                 await self._send(session_id, update_agent_message(text_block(f"Error: {exc}")))
@@ -140,7 +140,7 @@ class MiniMaxACPAgent:
                 await self._send(session_id, update_agent_thought(text_block(response.thinking)))
             if response.content:
                 await self._send(session_id, update_agent_message(text_block(response.content)))
-            agent.messages.append(Message(role="assistant", content=response.content, thinking=response.thinking, tool_calls=response.tool_calls))
+            agent.live_messages.append(Message(role="assistant", content=response.content, thinking=response.thinking, tool_calls=response.tool_calls))
             if not response.tool_calls:
                 return "end_turn"
             for call in response.tool_calls:
@@ -161,7 +161,7 @@ class MiniMaxACPAgent:
                     except Exception as exc:
                         status, text = "failed", f"[ERROR] Tool error: {exc}"
                 await self._send(session_id, update_tool_call(call.id, status=status, content=[tool_content(text_block(text))], raw_output=text))
-                agent.messages.append(Message(role="tool", content=text, tool_call_id=call.id, name=name))
+                agent.live_messages.append(Message(role="tool", content=text, tool_call_id=call.id, name=name))
         return "max_turn_requests"
 
     async def _send(self, session_id: str, update: Any) -> None:

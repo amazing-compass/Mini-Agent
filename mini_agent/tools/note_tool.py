@@ -144,8 +144,8 @@ class RecallNoteTool(Tool):
     def description(self) -> str:
         return (
             "Recall all previously recorded session notes. "
-            "Use this to retrieve important information, context, or decisions "
-            "from earlier in the session or previous agent execution chains."
+            "Note: Recorded notes are automatically pinned to context and survive compression. "
+            "Use this only if you need timestamps or category filtering."
         )
 
     @property

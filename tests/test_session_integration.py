@@ -152,9 +152,9 @@ def test_message_statistics(mock_llm_client, temp_workspace):
 
     # Add different types of messages
     agent.add_user_message("User message 1")
-    agent.messages.append(Message(role="assistant", content="Assistant response 1"))
+    agent.live_messages.append(Message(role="assistant", content="Assistant response 1"))
     agent.add_user_message("User message 2")
-    agent.messages.append(
+    agent.live_messages.append(
         Message(
             role="tool", content="Tool result", tool_call_id="123", name="test_tool"
         )

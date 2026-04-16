@@ -609,6 +609,10 @@ async def run_agent(workspace_dir: Path, task: str = None):
         workspace_dir=str(workspace_dir),
     )
 
+    # 7.5 Load pinned notes from previous sessions
+    if config.tools.enable_note:
+        agent.load_pinned_notes(str(workspace_dir / ".agent_memory.json"))
+
     # 8. Display welcome information
     if not task:
         print_banner()

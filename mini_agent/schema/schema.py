@@ -45,6 +45,18 @@ class TokenUsage(BaseModel):
     total_tokens: int = 0
 
 
+class ContextSummary(BaseModel):
+    """L4 compression product, independent of Message."""
+
+    covered_rounds: list[int]  # Which rounds are covered (e.g. [1,2,3,4,5])
+    user_goals: list[str]  # Original user prompts (preserved losslessly)
+    completed_work: list[str]  # Completed work items
+    active_files: list[str]  # Active files
+    key_findings: list[str]  # Key discoveries
+    pending_todo: list[str]  # Pending items
+    raw_text: str  # Rendered full text (for sending to API)
+
+
 class LLMResponse(BaseModel):
     """LLM response."""
 
