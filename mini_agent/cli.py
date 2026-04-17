@@ -30,7 +30,7 @@ from prompt_toolkit.styles import Style
 from mini_agent import LLMClient
 from mini_agent.agent import Agent
 from mini_agent.config import Config
-from mini_agent.schema import LLMProvider
+from mini_agent.llm.ha import ModelNode
 from mini_agent.tools.base import Tool
 from mini_agent.tools.bash_tool import BashKillTool, BashOutputTool, BashTool
 from mini_agent.tools.file_tools import EditTool, ReadTool, WriteTool
@@ -535,7 +535,7 @@ async def run_agent(workspace_dir: Path, task: str = None):
         print(f"{Colors.RED}❌ Error: Failed to load configuration file: {e}{Colors.RESET}")
         return
 
-    # 2. Initialize LLM client
+    # 2. Initialize LLM client (pool-aware)
     from mini_agent.retry import RetryConfig as RetryConfigBase
 
     # Convert configuration format
@@ -555,21 +555,60 @@ async def run_agent(workspace_dir: Path, task: str = None):
         next_delay = retry_config.calculate_delay(attempt - 1)
         print(f"{Colors.DIM}   Retrying in {next_delay:.1f}s (attempt {attempt + 1})...{Colors.RESET}")
 
-    # Convert provider string to LLMProvider enum
-    provider = LLMProvider.ANTHROPIC if config.llm.provider.lower() == "anthropic" else LLMProvider.OPENAI
+    # Build model nodes from the pool config. URL normalization (MiniMax
+    # suffix auto-append) is handled inside LLMClient._get_or_create_client
+    # — we pass api_base through verbatim so both CLI and direct
+    # `LLMClient.from_nodes(...)` users get identical behavior.
+    nodes: list[ModelNode] = []
+    for entry in config.llm.pool:
+        provider_str = entry.provider.lower()
+        nodes.append(
+            ModelNode(
+                node_id=entry.node_id,
+                provider=provider_str,
+                protocol_family=(entry.protocol_family or provider_str).lower(),
+                api_key=entry.api_key or "",
+                api_base=entry.api_base,
+                model=entry.model,
+                priority=entry.priority,
+                weight=entry.weight,
+                context_window=entry.context_window,
+                supports_tools=entry.supports_tools,
+                supports_thinking=entry.supports_thinking,
+                enabled=entry.enabled,
+            )
+        )
 
-    llm_client = LLMClient(
-        api_key=config.llm.api_key,
-        provider=provider,
-        api_base=config.llm.api_base,
-        model=config.llm.model,
+    llm_client = LLMClient.from_nodes(
+        nodes=nodes,
         retry_config=retry_config if config.llm.retry.enabled else None,
+        strategy=config.llm.routing.strategy,
+        failure_threshold=config.llm.routing.failure_threshold,
     )
 
     # Set retry callback
     if config.llm.retry.enabled:
         llm_client.retry_callback = on_retry
         print(f"{Colors.GREEN}✅ LLM retry mechanism enabled (max {config.llm.retry.max_retries} retries){Colors.RESET}")
+
+    # Observability: announce pool composition + failover events
+    if len(nodes) > 1:
+        node_summary = ", ".join(
+            f"{n.node_id}(p={n.priority},{n.provider},{n.model})" for n in nodes
+        )
+        print(
+            f"{Colors.GREEN}✅ LLM pool ready: {len(nodes)} nodes, strategy={config.llm.routing.strategy} "
+            f"[{node_summary}]{Colors.RESET}"
+        )
+
+        def on_failover(failed_node, next_node, exc, category):
+            print(
+                f"\n{Colors.BRIGHT_YELLOW}⤷ Failover{Colors.RESET} "
+                f"{Colors.DIM}({category.value}){Colors.RESET} "
+                f"{failed_node.node_id} → {next_node.node_id}: {exc}"
+            )
+
+        llm_client.on_failover = on_failover
 
     # 3. Initialize base tools (independent of workspace)
     tools, skill_loader = await initialize_base_tools(config)

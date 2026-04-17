@@ -73,22 +73,32 @@ class RetryExhaustedError(Exception):
 def async_retry(
     config: RetryConfig | None = None,
     on_retry: Callable[[Exception, int], None] | None = None,
+    should_retry: Callable[[Exception], bool] | None = None,
 ) -> Callable:
-    """Async function retry decorator
+    """Async function retry decorator.
 
     Args:
-        config: Retry configuration object, uses default config if None
-        on_retry: Callback function on retry, receives exception and current attempt number
+        config: Retry configuration object, uses default config if None.
+        on_retry: Callback invoked before each retry; receives exception and
+            the current attempt number.
+        should_retry: Optional predicate consulted AFTER `retryable_exceptions`
+            narrows the type. Return False to short-circuit the retry loop
+            (e.g. for auth/malformed-request errors that aren't worth
+            retrying on the same node). This keeps classification policy
+            out of `retry.py` while letting callers plug it in. If None,
+            every caught exception is treated as retryable.
 
     Returns:
-        Decorator function
+        Decorator function.
 
     Example:
         ```python
-        @async_retry(RetryConfig(max_retries=3, initial_delay=1.0))
+        @async_retry(
+            RetryConfig(max_retries=3, initial_delay=1.0),
+            should_retry=lambda e: is_retryable(classify_error(e)),
+        )
         async def call_api():
-            # API call code
-            pass
+            ...
         ```
     """
     if config is None:
@@ -106,6 +116,16 @@ def async_retry(
 
                 except config.retryable_exceptions as e:
                     last_exception = e
+
+                    # Classification gate: let callers veto retries for
+                    # errors that will clearly fail the same way next time
+                    # (auth, malformed schema, context overflow, ...).
+                    if should_retry is not None and not should_retry(e):
+                        logger.info(
+                            f"Function {func.__name__} raised {type(e).__name__}; "
+                            f"classified as non-retryable, raising immediately"
+                        )
+                        raise
 
                     # If this is the last attempt, don't retry
                     if attempt >= config.max_retries:

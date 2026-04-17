@@ -36,6 +36,10 @@ class LLMClientBase(ABC):
 
         # Callback for tracking retry count
         self.retry_callback = None
+        # Optional predicate used by the retry decorator to skip retries for
+        # non-retryable errors (e.g. auth, malformed-request). Set by the
+        # pool-aware LLMClient wrapper; left as None for standalone usage.
+        self.should_retry = None
 
     @abstractmethod
     async def generate(

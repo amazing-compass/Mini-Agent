@@ -278,7 +278,11 @@ class OpenAIClient(LLMClientBase):
         # Make API request with retry logic
         if self.retry_config.enabled:
             # Apply retry logic
-            retry_decorator = async_retry(config=self.retry_config, on_retry=self.retry_callback)
+            retry_decorator = async_retry(
+                config=self.retry_config,
+                on_retry=self.retry_callback,
+                should_retry=self.should_retry,
+            )
             api_call = retry_decorator(self._make_api_request)
             response = await api_call(
                 request_params["api_messages"],
