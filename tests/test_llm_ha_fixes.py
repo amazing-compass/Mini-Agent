@@ -165,9 +165,14 @@ class _TransientError(Exception):
 
 
 async def test_async_retry_without_should_retry_retries_everything() -> None:
-    """Backward compatibility: without should_retry, behavior is unchanged."""
+    """Legacy behavior — `retryable_exceptions=(Exception,)` catches everything.
+
+    Phase 2 changed the DEFAULT to `(TransientError,)`, so to reproduce
+    the old "retry everything" behavior tests must opt in explicitly
+    by passing `retryable_exceptions=(Exception,)`.
+    """
     calls = {"n": 0}
-    cfg = RetryConfig(max_retries=2, initial_delay=0.0, max_delay=0.0)
+    cfg = RetryConfig(max_retries=2, initial_delay=0.0, max_delay=0.0, retryable_exceptions=(Exception,))
 
     @async_retry(config=cfg)
     async def fail() -> None:
@@ -197,9 +202,15 @@ async def test_async_retry_short_circuits_on_non_retryable() -> None:
 
 
 async def test_async_retry_still_retries_transient() -> None:
-    """Fix #3 must not over-reach: transient errors still retry as before."""
+    """Fix #3 must not over-reach: transient errors still retry as before.
+
+    Phase 2 note: the default `retryable_exceptions` is now
+    `(TransientError,)` — this test uses a local fake 502 class, so we
+    explicitly opt in to `(Exception,)` + `should_retry` to keep the
+    original classifier-gate behavior under test.
+    """
     calls = {"n": 0}
-    cfg = RetryConfig(max_retries=2, initial_delay=0.0, max_delay=0.0)
+    cfg = RetryConfig(max_retries=2, initial_delay=0.0, max_delay=0.0, retryable_exceptions=(Exception,))
 
     from mini_agent.llm.ha import classify_error, is_retryable
 
@@ -215,7 +226,7 @@ async def test_async_retry_still_retries_transient() -> None:
 
 async def test_async_retry_recovers_when_transient_eventually_succeeds() -> None:
     calls = {"n": 0}
-    cfg = RetryConfig(max_retries=3, initial_delay=0.0, max_delay=0.0)
+    cfg = RetryConfig(max_retries=3, initial_delay=0.0, max_delay=0.0, retryable_exceptions=(Exception,))
 
     from mini_agent.llm.ha import classify_error, is_retryable
 

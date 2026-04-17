@@ -182,10 +182,34 @@ def test_pool_routing_defaults_applied(tmp_path: Path) -> None:
     )
     cfg = Config.from_yaml(p)
     assert cfg.llm.routing.strategy == "priority"
-    assert cfg.llm.routing.failure_threshold == 3
+    # Phase 2: breaker owns failure_threshold; routing doesn't carry it.
+    assert cfg.llm.breaker.failure_threshold == 3
 
 
-def test_pool_routing_overrides_honored(tmp_path: Path) -> None:
+def test_pool_breaker_overrides_honored(tmp_path: Path) -> None:
+    p = _write_yaml(
+        tmp_path,
+        {
+            "routing": {"strategy": "priority"},
+            "breaker": {"failure_threshold": 5, "cooldown_seconds": 30.0},
+            "pool": [
+                {
+                    "node_id": "a",
+                    "provider": "anthropic",
+                    "api_key": "sk-x",
+                    "api_base": "https://api.minimax.io",
+                    "model": "MiniMax-M2.7",
+                }
+            ],
+        },
+    )
+    cfg = Config.from_yaml(p)
+    assert cfg.llm.breaker.failure_threshold == 5
+    assert cfg.llm.breaker.cooldown_seconds == 30.0
+
+
+def test_routing_failure_threshold_is_rejected(tmp_path: Path) -> None:
+    """Loud failure instead of a silent no-op — design §5.8 moved the knob to breaker."""
     p = _write_yaml(
         tmp_path,
         {
@@ -201,8 +225,10 @@ def test_pool_routing_overrides_honored(tmp_path: Path) -> None:
             ],
         },
     )
-    cfg = Config.from_yaml(p)
-    assert cfg.llm.routing.failure_threshold == 5
+    import pytest
+
+    with pytest.raises(ValueError, match="routing.failure_threshold"):
+        Config.from_yaml(p)
 
 
 def test_real_config_yaml_loads_with_three_nodes() -> None:

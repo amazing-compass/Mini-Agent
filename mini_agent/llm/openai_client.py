@@ -9,6 +9,7 @@ from openai import AsyncOpenAI
 from ..retry import RetryConfig, async_retry
 from ..schema import FunctionCall, LLMResponse, Message, TokenUsage, ToolCall
 from .base import LLMClientBase
+from .ha.errors import LLMError, normalize_sdk_error
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,8 @@ class OpenAIClient(LLMClientBase):
         api_base: str = "https://api.minimaxi.com/v1",
         model: str = "MiniMax-M2.5",
         retry_config: RetryConfig | None = None,
+        *,
+        default_max_tokens: int | None = None,
     ):
         """Initialize OpenAI client.
 
@@ -36,8 +39,9 @@ class OpenAIClient(LLMClientBase):
             api_base: Base URL for the API (default: MiniMax OpenAI endpoint)
             model: Model name to use (default: MiniMax-M2.5)
             retry_config: Optional retry configuration
+            default_max_tokens: Fallback for `generate(max_tokens=...)`.
         """
-        super().__init__(api_key, api_base, model, retry_config)
+        super().__init__(api_key, api_base, model, retry_config, default_max_tokens=default_max_tokens)
 
         # Initialize OpenAI client
         self.client = AsyncOpenAI(
@@ -49,18 +53,26 @@ class OpenAIClient(LLMClientBase):
         self,
         api_messages: list[dict[str, Any]],
         tools: list[Any] | None = None,
+        *,
+        max_tokens: int | None = None,
     ) -> Any:
         """Execute API request (core method that can be retried).
 
         Args:
             api_messages: List of messages in OpenAI format
             tools: Optional list of tools
+            max_tokens: Output budget for this call (computed by the
+                router). When None, the parameter is **omitted entirely**
+                so the provider applies its own default — preserves the
+                pre-Phase-2 behavior for direct/ACP callers who never
+                configure the knob.
 
         Returns:
             OpenAI ChatCompletion response (full response including usage)
 
         Raises:
-            Exception: API call failed
+            LLMError subclass: normalized from the SDK exception so the router
+            and retry layer never see vendor-specific error types.
         """
         params = {
             "model": self.model,
@@ -68,14 +80,20 @@ class OpenAIClient(LLMClientBase):
             # Enable reasoning_split to separate thinking content
             "extra_body": {"reasoning_split": True},
         }
+        # Only send max_tokens when explicitly configured — otherwise
+        # let the provider use its own (usually larger) default.
+        if max_tokens is not None:
+            params["max_tokens"] = max_tokens
 
         if tools:
             params["tools"] = self._convert_tools(tools)
 
-        # Use OpenAI SDK's chat.completions.create
-        response = await self.client.chat.completions.create(**params)
-        # Return full response to access usage info
-        return response
+        try:
+            return await self.client.chat.completions.create(**params)
+        except LLMError:
+            raise
+        except Exception as exc:
+            raise normalize_sdk_error(exc) from exc
 
     def _convert_tools(self, tools: list[Any]) -> list[dict[str, Any]]:
         """Convert tools to OpenAI format.
@@ -209,8 +227,8 @@ class OpenAIClient(LLMClientBase):
         Returns:
             LLMResponse object
         """
-        # Get message from response
-        message = response.choices[0].message
+        choice = response.choices[0]
+        message = choice.message
 
         # Extract text content
         text_content = message.content or ""
@@ -250,11 +268,15 @@ class OpenAIClient(LLMClientBase):
                 total_tokens=response.usage.total_tokens or 0,
             )
 
+        # Fix: read real finish_reason from choices[0] instead of hardcoding "stop".
+        # Possible values: "stop", "length", "tool_calls", "content_filter", "function_call".
+        finish_reason = getattr(choice, "finish_reason", None) or "stop"
+
         return LLMResponse(
             content=text_content,
             thinking=thinking_content if thinking_content else None,
             tool_calls=tool_calls if tool_calls else None,
-            finish_reason="stop",  # OpenAI doesn't provide finish_reason in the message
+            finish_reason=finish_reason,
             usage=usage,
         )
 
@@ -262,18 +284,25 @@ class OpenAIClient(LLMClientBase):
         self,
         messages: list[Message],
         tools: list[Any] | None = None,
+        *,
+        max_tokens: int | None = None,
     ) -> LLMResponse:
         """Generate response from OpenAI LLM.
 
         Args:
             messages: List of conversation messages
             tools: Optional list of available tools
+            max_tokens: Output budget for this call (computed by the router).
 
         Returns:
             LLMResponse containing the generated content
         """
         # Prepare request
         request_params = self._prepare_request(messages, tools)
+        # Precedence: explicit caller → configured default → None
+        # (which makes `_make_api_request` omit the field so the provider
+        # applies its own larger default).
+        effective_max_tokens = max_tokens if max_tokens is not None else self.default_max_tokens
 
         # Make API request with retry logic
         if self.retry_config.enabled:
@@ -287,12 +316,14 @@ class OpenAIClient(LLMClientBase):
             response = await api_call(
                 request_params["api_messages"],
                 request_params["tools"],
+                max_tokens=effective_max_tokens,
             )
         else:
             # Don't use retry
             response = await self._make_api_request(
                 request_params["api_messages"],
                 request_params["tools"],
+                max_tokens=effective_max_tokens,
             )
 
         # Parse and return response

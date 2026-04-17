@@ -25,11 +25,11 @@ from .anthropic_client import AnthropicClient
 from .base import LLMClientBase
 from .ha import (
     ErrorCategory,
-    HealthRegistry,
     ModelNode,
     ModelPool,
     ModelRouter,
     RoutingDecision,
+    SimpleBreaker,
     classify_error,
     is_retryable,
 )
@@ -86,6 +86,7 @@ class LLMClient:
         nodes: list[ModelNode] | None = None,
         strategy: str = "priority",
         failure_threshold: int = 3,
+        cooldown_seconds: float = 60.0,
     ) -> None:
         """Initialize the client.
 
@@ -103,6 +104,8 @@ class LLMClient:
             strategy: Router strategy (Phase 1: only "priority").
             failure_threshold: Consecutive failures before a node is
                 considered unhealthy.
+            cooldown_seconds: Open-state cooldown before a node may be
+                probed again (half-open). Phase 2 default: 60s.
         """
         self.retry_config = retry_config or RetryConfig()
 
@@ -123,9 +126,23 @@ class LLMClient:
                 )
             ]
 
+        # The breaker is the authoritative owner of per-node health state.
+        # Phase 2 passes cooldown_seconds through so the open→half-open
+        # dead time is honored. HealthRegistry aliases SimpleBreaker.
+        self.breaker: SimpleBreaker = SimpleBreaker(
+            failure_threshold=failure_threshold,
+            cooldown_seconds=cooldown_seconds,
+        )
+        # Keep `.health_registry` reachable — existing code (including
+        # tests and ACP) reads it for snapshots.
+        self.health_registry = self.breaker
+
+        # Pool is built **without** the client factory here because
+        # `_get_or_create_client` already caches by node_id; registering
+        # the cached client with the pool preserves lazy test patterns
+        # while the Phase 2 router still finds them via `pool.get_client`.
         self.pool = ModelPool(nodes)
-        self.health_registry = HealthRegistry(failure_threshold=failure_threshold)
-        self.router = ModelRouter(self.pool, self.health_registry, strategy=strategy)
+        self.router = ModelRouter(self.pool, self.breaker, strategy=strategy)
 
         self._clients: dict[str, LLMClientBase] = {}
         self._retry_callback: Callable[[Exception, int], None] | None = None
@@ -167,6 +184,7 @@ class LLMClient:
         *,
         strategy: str = "priority",
         failure_threshold: int = 3,
+        cooldown_seconds: float = 60.0,
     ) -> "LLMClient":
         """Construct a pool-based client from pre-resolved ModelNode entries."""
         return cls(
@@ -174,6 +192,7 @@ class LLMClient:
             retry_config=retry_config,
             strategy=strategy,
             failure_threshold=failure_threshold,
+            cooldown_seconds=cooldown_seconds,
         )
 
     @property
@@ -191,15 +210,39 @@ class LLMClient:
         messages: list[Message],
         tools: list[Any] | None = None,
     ) -> LLMResponse:
-        """Route the request through the pool, failing over on error."""
+        """Route the request through the pool (Phase 2 full path).
 
-        async def call_on_node(node: ModelNode) -> LLMResponse:
-            client = self._get_or_create_client(node)
-            return await client.generate(messages, tools)
+        Uses `ModelRouter.call` which drives three-bucket classification
+        + circuit breaker + dynamic max_tokens. Clients for each pool
+        node are materialized lazily via `_get_or_create_client` and
+        handed to the router through the pool's client cache.
+        """
+        # Ensure every enabled node has a registered client *before* the
+        # router starts dispatching — the router reads from the pool,
+        # not from us, but we still own the cache logic (URL normalization,
+        # should_retry injection, etc.).
+        for node in self.pool.enabled():
+            if not self.pool.has_client(node.node_id):
+                self.pool.set_client(node.node_id, self._get_or_create_client(node))
 
-        response, decision = await self.router.execute(call_on_node)
-        self.last_routing_decision = decision
+        response = await self.router.call(messages, tools)
+        self.last_routing_decision = self.router.last_routing_decision
         return response
+
+    async def internal_call(
+        self,
+        messages: list[Message],
+        tools: list[Any] | None = None,
+    ) -> LLMResponse:
+        """Agent-internal bypass — see `ModelRouter.internal_call`.
+
+        Used by `Agent._create_structured_summary` so summary failures
+        don't poison node health and don't trigger recursive compression.
+        """
+        for node in self.pool.enabled():
+            if not self.pool.has_client(node.node_id):
+                self.pool.set_client(node.node_id, self._get_or_create_client(node))
+        return await self.router.internal_call(messages, tools)
 
     def health_snapshots(self) -> dict[str, Any]:
         """Expose per-node health snapshots for logs / /stats commands."""
@@ -226,6 +269,7 @@ class LLMClient:
                 api_base=normalized_base,
                 model=node.model,
                 retry_config=self.retry_config,
+                default_max_tokens=node.max_output_tokens,
             )
         elif provider == LLMProvider.OPENAI.value:
             client = OpenAIClient(
@@ -233,6 +277,7 @@ class LLMClient:
                 api_base=normalized_base,
                 model=node.model,
                 retry_config=self.retry_config,
+                default_max_tokens=node.max_output_tokens,
             )
         else:
             raise ValueError(f"Unsupported provider for node {node.node_id!r}: {node.provider!r}")
@@ -242,6 +287,8 @@ class LLMClient:
         # so the router can fail over without burning the full backoff budget.
         client.should_retry = lambda exc: is_retryable(classify_error(exc))
         self._clients[node.node_id] = client
+        # Mirror into the pool's client cache so ModelRouter.call can reach it.
+        self.pool.set_client(node.node_id, client)
         return client
 
     def _handle_failover(

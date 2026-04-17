@@ -20,6 +20,10 @@ class ModelNode(BaseModel):
     priority: int = 100
     weight: int = 10
     context_window: int = 128000
+    # Upper bound on `max_tokens` the node advertises — Router uses
+    # min(node.max_output_tokens, context_window - estimate - margin) to
+    # derive the actual per-request budget (see design §7.4).
+    max_output_tokens: int = 8192
     supports_tools: bool = True
     supports_thinking: bool = True
     enabled: bool = True
@@ -38,6 +42,9 @@ class NodeHealthSnapshot(BaseModel):
     last_error_category: str | None = None
     last_error_message: str | None = None
     is_healthy: bool = True
+    # Phase 2 circuit-breaker fields (closed / open / half-open).
+    circuit_state: str = "closed"
+    cooldown_until: float | None = None
 
 
 class RoutingDecision(BaseModel):

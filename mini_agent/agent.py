@@ -4,11 +4,12 @@ import asyncio
 import json
 from pathlib import Path
 from time import perf_counter
-from typing import Optional
+from typing import Any, Optional
 
 import tiktoken
 
 from .llm import LLMClient
+from .llm.ha import ContextOverflowError
 from .logger import AgentLogger
 from .schema import ContextSummary, Message
 from .tools.base import Tool, ToolResult
@@ -495,11 +496,23 @@ Requirements:
 - Be concise, under 800 words total
 - English only"""
 
+        summary_messages = [
+            Message(role="system", content="You summarize agent execution histories in structured format."),
+            Message(role="user", content=prompt),
+        ]
+        # L4 summary goes through the router's **internal_call** bypass so
+        # a summary failure or cooldown-open node doesn't poison business
+        # node health or recurse back into compression. `internal_call` is
+        # exposed by the LLMClient facade, which delegates to the router.
+        caller = getattr(self.llm, "internal_call", None)
         try:
-            response = await self.llm.generate(messages=[
-                Message(role="system", content="You summarize agent execution histories in structured format."),
-                Message(role="user", content=prompt),
-            ])
+            if caller is not None:
+                response = await caller(messages=summary_messages)
+            else:
+                # Legacy path (tests/mocks without `internal_call`): fall
+                # back to `generate`. Accepts the slightly higher risk
+                # because those callers don't participate in the breaker.
+                response = await self.llm.generate(messages=summary_messages)
             return response.content
         except Exception:
             # Fallback: return truncated raw content
@@ -507,6 +520,84 @@ Requirements:
                 f"## Completed Work\n- (Summary generation failed)\n\n"
                 f"## Key Findings\n- Raw content length: {len(content)} chars"
             )
+
+    # ---- Router interop: ContextOverflowError recovery ----
+
+    async def safe_generate(self, tool_list: list) -> Any:
+        """Public entry point: call the LLM with ContextOverflow recovery.
+
+        Both `Agent.run()` (CLI path) and any external driver that owns
+        this Agent (e.g. ACP sessions) should go through here instead of
+        calling `self.llm.generate(...)` directly — otherwise the
+        Phase 2 router's pre-flight `ContextOverflowError` surfaces as a
+        hard crash instead of triggering the L1/L2/L4 compression +
+        retry flow defined by design §5.7.
+
+        The method is a thin wrapper around
+        `_generate_with_overflow_recovery` and exists so the naming
+        signals "drivers should call this, not .llm.generate".
+        """
+        return await self._generate_with_overflow_recovery(tool_list)
+
+    async def _generate_with_overflow_recovery(self, tool_list: list) -> Any:
+        """Call the LLM, recovering from ContextOverflowError via L1/L2/L4.
+
+        The router raises `ContextOverflowError` in two cases (design §5.7):
+        1. pre-flight: at least one healthy node exists but none fit the
+           current messages
+        2. event-time: a node accepted the request but the provider
+           responded with a 400 context_length_exceeded
+
+        Both are the agent's responsibility. We compress memory and
+        retry once.
+
+        **Why L4 fires unconditionally here**: our local `_estimate_tokens`
+        only counts `render_for_provider()` output — it does NOT count
+        tool schemas (which can run 5-10k+ tokens for a full MCP set)
+        and it does NOT see per-node `context_window` differences.
+        A ContextOverflowError means the router's estimate (which DOES
+        count tools) already said "won't fit", so trusting our local
+        estimate to decide whether to compress causes infinite retry
+        loops on the exact case this method exists to handle.
+        `_full_compress` is itself a no-op when there's nothing to
+        compress (no older rounds), so calling it unconditionally is safe.
+        """
+        try:
+            return await self.llm.generate(
+                messages=self.render_for_provider(), tools=tool_list
+            )
+        except ContextOverflowError as exc:
+            print(
+                f"\n{Colors.BRIGHT_YELLOW}⚠️  ContextOverflow: {exc}. "
+                f"Compressing memory and retrying...{Colors.RESET}"
+            )
+
+        # L1: drop placeholder-able tool results from older rounds.
+        self._truncate_old_tool_results(keep_recent_n=3)
+        # L2: shrink older read_file results to path-bearing placeholders.
+        self._truncate_old_readfile_results(keep_recent_n=3)
+
+        # L4: always run — see docstring for why the agent's own
+        # estimate cannot be trusted to skip compression here.
+        await self._full_compress(keep_recent_n=3)
+        self._skip_next_token_check = True
+
+        # Post-L4 safety: the kept rounds may still exceed token_limit on
+        # their own, or the request may be tool-schema-heavy. Tighten the
+        # keep window and, as a last resort, content-truncate large tool
+        # results so the retry has a real chance of fitting.
+        if self._estimate_tokens() > self.token_limit:
+            self._truncate_old_tool_results(keep_recent_n=1)
+            self._truncate_old_readfile_results(keep_recent_n=1)
+            if self._estimate_tokens() > self.token_limit:
+                self._content_truncate_large_tool_results()
+
+        # One retry with the compressed messages. If this *also* raises
+        # ContextOverflowError, let it propagate — agent has done
+        # everything it can, the caller sees a real failure.
+        return await self.llm.generate(
+            messages=self.render_for_provider(), tools=tool_list
+        )
 
     # --- Pinned Notes ---
 
@@ -605,7 +696,7 @@ Requirements:
             self.logger.log_request(messages=self.render_for_provider(), tools=tool_list)
 
             try:
-                response = await self.llm.generate(messages=self.render_for_provider(), tools=tool_list)
+                response = await self.safe_generate(tool_list)
             except Exception as e:
                 # Check if it's a retry exhausted error
                 from .retry import RetryExhaustedError

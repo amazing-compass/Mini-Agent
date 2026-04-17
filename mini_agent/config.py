@@ -50,10 +50,22 @@ class RetryConfig(BaseModel):
 
 
 class RoutingConfig(BaseModel):
-    """Pool-level routing configuration"""
+    """Pool-level routing configuration.
+
+    Phase 2 moved `failure_threshold` into `BreakerConfig` because the
+    breaker is the authoritative owner of node health state (design
+    §5.8). Keeping the field here would be a dead option that silently
+    changes semantics for anyone still setting it.
+    """
 
     strategy: str = "priority"  # Phase 1 only implements priority
-    failure_threshold: int = 3  # consecutive failures before node is marked unhealthy
+
+
+class BreakerConfig(BaseModel):
+    """3-state circuit-breaker settings (Phase 2)."""
+
+    failure_threshold: int = 3  # consecutive failures → closed → open
+    cooldown_seconds: float = 60.0  # dead time before open → half-open probe
 
 
 class ModelNodeConfig(BaseModel):
@@ -69,6 +81,7 @@ class ModelNodeConfig(BaseModel):
     priority: int = 100
     weight: int = 10
     context_window: int = 128000
+    max_output_tokens: int = 8192
     supports_tools: bool = True
     supports_thinking: bool = True
     enabled: bool = True
@@ -88,6 +101,7 @@ class LLMConfig(BaseModel):
     provider: str = "anthropic"
     retry: RetryConfig = Field(default_factory=RetryConfig)
     routing: RoutingConfig = Field(default_factory=RoutingConfig)
+    breaker: BreakerConfig = Field(default_factory=BreakerConfig)
     pool: list[ModelNodeConfig] = Field(default_factory=list)
 
 
@@ -151,9 +165,23 @@ def _build_retry_config(data: dict[str, Any]) -> RetryConfig:
 
 
 def _build_routing_config(data: dict[str, Any]) -> RoutingConfig:
+    if "failure_threshold" in data:
+        # Loud failure instead of silent no-op. Design §5.8: breaker owns
+        # failure_threshold exclusively; leaving the knob here would let
+        # someone set it and wonder why nothing changed.
+        raise ValueError(
+            "`routing.failure_threshold` is no longer accepted — move it to "
+            "`breaker.failure_threshold` (see config-example.yaml)."
+        )
     return RoutingConfig(
         strategy=data.get("strategy", "priority"),
-        failure_threshold=data.get("failure_threshold", 3),
+    )
+
+
+def _build_breaker_config(data: dict[str, Any]) -> BreakerConfig:
+    return BreakerConfig(
+        failure_threshold=int(data.get("failure_threshold", 3)),
+        cooldown_seconds=float(data.get("cooldown_seconds", 60.0)),
     )
 
 
@@ -187,6 +215,7 @@ def _build_pool_entries(pool_raw: list[dict[str, Any]]) -> list[ModelNodeConfig]
             priority=int(raw.get("priority", 100)),
             weight=int(raw.get("weight", 10)),
             context_window=int(raw.get("context_window", 128000)),
+            max_output_tokens=int(raw.get("max_output_tokens", 8192)),
             supports_tools=bool(raw.get("supports_tools", True)),
             supports_thinking=bool(raw.get("supports_thinking", True)),
             enabled=bool(raw.get("enabled", True)),
@@ -254,12 +283,14 @@ class Config(BaseModel):
         if pool_raw is None:
             pool_raw = data.get("pool")
 
-        # Retry / routing blocks: also accept either nested or top-level.
+        # Retry / routing / breaker blocks: also accept either nested or top-level.
         retry_raw = (llm_section.get("retry") if llm_section else None) or data.get("retry") or {}
         routing_raw = (llm_section.get("routing") if llm_section else None) or data.get("routing") or {}
+        breaker_raw = (llm_section.get("breaker") if llm_section else None) or data.get("breaker") or {}
 
         retry_config = _build_retry_config(retry_raw)
         routing_config = _build_routing_config(routing_raw)
+        breaker_config = _build_breaker_config(breaker_raw)
 
         pool_entries = _build_pool_entries(pool_raw or [])
 
@@ -302,6 +333,7 @@ class Config(BaseModel):
             provider=primary.provider,
             retry=retry_config,
             routing=routing_config,
+            breaker=breaker_config,
             pool=pool_entries,
         )
 

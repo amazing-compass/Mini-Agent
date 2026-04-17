@@ -538,14 +538,16 @@ async def run_agent(workspace_dir: Path, task: str = None):
     # 2. Initialize LLM client (pool-aware)
     from mini_agent.retry import RetryConfig as RetryConfigBase
 
-    # Convert configuration format
+    # Convert configuration format. retryable_exceptions is left at the
+    # Phase 2 default — (TransientError,) — so auth / malformed / capacity
+    # errors propagate out of the node's retry envelope immediately,
+    # letting the router make the routing decision.
     retry_config = RetryConfigBase(
         enabled=config.llm.retry.enabled,
         max_retries=config.llm.retry.max_retries,
         initial_delay=config.llm.retry.initial_delay,
         max_delay=config.llm.retry.max_delay,
         exponential_base=config.llm.retry.exponential_base,
-        retryable_exceptions=(Exception,),
     )
 
     # Create retry callback function to display retry information in terminal
@@ -573,6 +575,7 @@ async def run_agent(workspace_dir: Path, task: str = None):
                 priority=entry.priority,
                 weight=entry.weight,
                 context_window=entry.context_window,
+                max_output_tokens=entry.max_output_tokens,
                 supports_tools=entry.supports_tools,
                 supports_thinking=entry.supports_thinking,
                 enabled=entry.enabled,
@@ -583,7 +586,8 @@ async def run_agent(workspace_dir: Path, task: str = None):
         nodes=nodes,
         retry_config=retry_config if config.llm.retry.enabled else None,
         strategy=config.llm.routing.strategy,
-        failure_threshold=config.llm.routing.failure_threshold,
+        failure_threshold=config.llm.breaker.failure_threshold,
+        cooldown_seconds=config.llm.breaker.cooldown_seconds,
     )
 
     # Set retry callback
@@ -640,12 +644,19 @@ async def run_agent(workspace_dir: Path, task: str = None):
         system_prompt = system_prompt.replace("{SKILLS_METADATA}", "")
 
     # 7. Create Agent
+    # Derive `token_limit` from the pool's smallest enabled context window
+    # × 0.8 — a conservative floor so compression fires before any node
+    # in the pool overflows, regardless of which one the router lands on.
+    # Agent stays blissfully unaware of the NodePool itself (design §7.3).
+    pool_windows = llm_client.pool.all_context_windows()
+    token_limit = int(min(pool_windows) * 0.8) if pool_windows else 80000
     agent = Agent(
         llm_client=llm_client,
         system_prompt=system_prompt,
         tools=tools,
         max_steps=config.agent.max_steps,
         workspace_dir=str(workspace_dir),
+        token_limit=token_limit,
     )
 
     # 7.5 Load pinned notes from previous sessions

@@ -131,7 +131,12 @@ class MiniMaxACPAgent:
                 return "cancelled"
             tool_schemas = [tool.to_schema() for tool in agent.tools.values()]
             try:
-                response = await agent.llm.generate(messages=agent.render_for_provider(), tools=tool_schemas)
+                # Route through Agent.safe_generate (not raw .llm.generate) so
+                # the Phase 2 router's pre-flight ContextOverflowError gets
+                # caught and converted to the L1/L2/L4 compress-and-retry
+                # path. Otherwise long ACP sessions with large tool schemas
+                # would crash with "no healthy node fits current messages".
+                response = await agent.safe_generate(tool_list=tool_schemas)
             except Exception as exc:
                 logger.exception("LLM error")
                 await self._send(session_id, update_agent_message(text_block(f"Error: {exc}")))

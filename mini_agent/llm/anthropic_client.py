@@ -8,6 +8,7 @@ import anthropic
 from ..retry import RetryConfig, async_retry
 from ..schema import FunctionCall, LLMResponse, Message, TokenUsage, ToolCall
 from .base import LLMClientBase
+from .ha.errors import LLMError, normalize_sdk_error
 
 logger = logging.getLogger(__name__)
 
@@ -21,12 +22,20 @@ class AnthropicClient(LLMClientBase):
     - Retry logic
     """
 
+    # Anthropic SDK requires `max_tokens` on every request (it has no
+    # "unlimited" sentinel). Preserve the pre-Phase-2 hardcoded value
+    # so direct/ACP callers that never configure the knob keep working
+    # the same way. Router-driven calls always pass an explicit value.
+    _LEGACY_MAX_TOKENS = 16384
+
     def __init__(
         self,
         api_key: str,
         api_base: str = "https://api.minimaxi.com/anthropic",
         model: str = "MiniMax-M2.5",
         retry_config: RetryConfig | None = None,
+        *,
+        default_max_tokens: int | None = None,
     ):
         """Initialize Anthropic client.
 
@@ -35,8 +44,9 @@ class AnthropicClient(LLMClientBase):
             api_base: Base URL for the API (default: MiniMax Anthropic endpoint)
             model: Model name to use (default: MiniMax-M2.5)
             retry_config: Optional retry configuration
+            default_max_tokens: Fallback for `generate(max_tokens=...)`.
         """
-        super().__init__(api_key, api_base, model, retry_config)
+        super().__init__(api_key, api_base, model, retry_config, default_max_tokens=default_max_tokens)
 
         # Initialize Anthropic async client
         self.client = anthropic.AsyncAnthropic(
@@ -50,6 +60,8 @@ class AnthropicClient(LLMClientBase):
         system_message: str | None,
         api_messages: list[dict[str, Any]],
         tools: list[Any] | None = None,
+        *,
+        max_tokens: int,
     ) -> anthropic.types.Message:
         """Execute API request (core method that can be retried).
 
@@ -57,16 +69,18 @@ class AnthropicClient(LLMClientBase):
             system_message: Optional system message
             api_messages: List of messages in Anthropic format
             tools: Optional list of tools
+            max_tokens: Output budget for this call (computed by the router).
 
         Returns:
             Anthropic Message response
 
         Raises:
-            Exception: API call failed
+            LLMError subclass: normalized from the SDK exception so the router
+            and retry layer never see vendor-specific error types.
         """
         params = {
             "model": self.model,
-            "max_tokens": 16384,
+            "max_tokens": max_tokens,
             "messages": api_messages,
         }
 
@@ -76,9 +90,12 @@ class AnthropicClient(LLMClientBase):
         if tools:
             params["tools"] = self._convert_tools(tools)
 
-        # Use Anthropic SDK's async messages.create
-        response = await self.client.messages.create(**params)
-        return response
+        try:
+            return await self.client.messages.create(**params)
+        except LLMError:
+            raise  # already normalized — don't double-wrap
+        except Exception as exc:
+            raise normalize_sdk_error(exc) from exc
 
     def _convert_tools(self, tools: list[Any]) -> list[dict[str, Any]]:
         """Convert tools to Anthropic format.
@@ -270,18 +287,30 @@ class AnthropicClient(LLMClientBase):
         self,
         messages: list[Message],
         tools: list[Any] | None = None,
+        *,
+        max_tokens: int | None = None,
     ) -> LLMResponse:
         """Generate response from Anthropic LLM.
 
         Args:
             messages: List of conversation messages
             tools: Optional list of available tools
+            max_tokens: Output budget for this call. When None the client
+                falls back to `self.default_max_tokens` (set by the router
+                when building the client, or a conservative default for
+                direct/legacy callers).
 
         Returns:
             LLMResponse containing the generated content
         """
         # Prepare request
         request_params = self._prepare_request(messages, tools)
+        # Precedence: explicit caller value → configured default → legacy 16384.
+        effective_max_tokens = (
+            max_tokens
+            if max_tokens is not None
+            else (self.default_max_tokens or self._LEGACY_MAX_TOKENS)
+        )
 
         # Make API request with retry logic
         if self.retry_config.enabled:
@@ -296,6 +325,7 @@ class AnthropicClient(LLMClientBase):
                 request_params["system_message"],
                 request_params["api_messages"],
                 request_params["tools"],
+                max_tokens=effective_max_tokens,
             )
         else:
             # Don't use retry
@@ -303,6 +333,7 @@ class AnthropicClient(LLMClientBase):
                 request_params["system_message"],
                 request_params["api_messages"],
                 request_params["tools"],
+                max_tokens=effective_max_tokens,
             )
 
         # Parse and return response

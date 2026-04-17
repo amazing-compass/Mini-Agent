@@ -1,8 +1,14 @@
-"""Error classification for routing decisions.
+"""Custom exceptions + error classification for the HA layer.
 
-The classifier is duck-typed so it works for both the Anthropic and OpenAI
-SDKs without importing them here. It inspects the exception's class name,
-any `status_code`/`code` attributes, and falls back to UNKNOWN.
+Phase 2 introduces explicit exception types for every error class that
+matters to routing. Provider clients are responsible for translating
+vendor-specific SDK exceptions into these types *inside their
+`_make_api_request` methods* — the router and retry layer only ever see
+these neutral types.
+
+The `ErrorCategory` enum / `classify_error` helpers are kept as a
+fallback (and for logging / snapshot output) so pre-Phase-2 callers or
+SDK errors that escape the normalizer still classify sensibly.
 """
 
 from __future__ import annotations
@@ -12,32 +18,88 @@ from enum import Enum
 from ...retry import RetryExhaustedError
 
 
-class ErrorCategory(str, Enum):
-    """Outcome categories for an LLM call failure."""
-
-    TRANSIENT = "transient"  # timeouts, 5xx, connection errors — retry + failover OK
-    RATE_LIMIT = "rate_limit"  # 429 / capacity — failover OK, briefly deprioritize node
-    AUTH = "auth"  # 401/403 — do NOT retry node; mark node unhealthy
-    NODE_UNAVAILABLE = "node_unavailable"  # 404/405 — endpoint or model missing on THIS node
-    REQUEST_MALFORMED = "request_malformed"  # 400 schema / tool format — program bug, don't mask
-    CAPACITY = "capacity"  # context-overflow style 400 — upstream concern
-    UNKNOWN = "unknown"  # conservative default: retry + failover
+# ---------------------------------------------------------------------------
+# Custom exception hierarchy — raised by provider clients after SDK errors
+# are normalized. Router / retry speak only in these terms.
+# ---------------------------------------------------------------------------
 
 
-class PoolExhaustedError(Exception):
-    """Raised by the router when every candidate node has failed."""
+class LLMError(Exception):
+    """Root of the neutral exception hierarchy."""
 
-    def __init__(self, attempts: list[tuple[str, "ErrorCategory", Exception]]):
-        self.attempts = attempts
-        last = attempts[-1] if attempts else None
+
+class TransientError(LLMError):
+    """Network hiccup, timeout, or 5xx — worth retrying briefly."""
+
+
+class RateLimitError(LLMError):
+    """429 / explicit rate-limit signal — skip in-node retry, fail over."""
+
+
+class AuthError(LLMError):
+    """401 / 403 — credentials are bad for THIS node; fail over, record failure."""
+
+
+class NodeUnavailableError(LLMError):
+    """404 / 405 — endpoint or model missing on THIS node. Switchable."""
+
+
+class BadRequestError(LLMError):
+    """400 schema / malformed request — program bug, do NOT fail over."""
+
+
+class ContextOverflowError(LLMError):
+    """Context window exceeded. Caller (agent) must compress, not fail over."""
+
+
+# ---------------------------------------------------------------------------
+# Routing-level errors
+# ---------------------------------------------------------------------------
+
+
+class NoAvailableNodeError(LLMError):
+    """The pool yielded no candidates (all disabled, nothing enabled, etc.)."""
+
+
+class AllNodesFailedError(LLMError):
+    """Every healthy + fitting candidate was tried and failed for real reasons."""
+
+    def __init__(
+        self,
+        message: str = "",
+        attempts: list[tuple[str, "ErrorCategory", Exception]] | None = None,
+    ) -> None:
+        self.attempts = list(attempts or [])
+        last = self.attempts[-1] if self.attempts else None
         self.last_exception: Exception | None = last[2] if last else None
         self.last_category: ErrorCategory | None = last[1] if last else None
 
-        summary = ", ".join(f"{nid}({cat.value})" for nid, cat, _ in attempts) or "<none>"
-        last_msg = f"{type(last[2]).__name__}: {last[2]}" if last else "unknown"
-        super().__init__(
-            f"All {len(attempts)} model node(s) exhausted. Attempts: [{summary}]. Last error: {last_msg}"
-        )
+        if not message:
+            summary = ", ".join(f"{nid}({cat.value})" for nid, cat, _ in self.attempts) or "<none>"
+            last_msg = f"{type(last[2]).__name__}: {last[2]}" if last else "unknown"
+            message = f"All {len(self.attempts)} candidate(s) exhausted. Attempts: [{summary}]. Last error: {last_msg}"
+        super().__init__(message)
+
+
+# Backward-compat alias — Phase 1 code imports this name.
+PoolExhaustedError = AllNodesFailedError
+
+
+# ---------------------------------------------------------------------------
+# Legacy category system — still useful for logging / health snapshots
+# ---------------------------------------------------------------------------
+
+
+class ErrorCategory(str, Enum):
+    """Outcome categories for an LLM call failure."""
+
+    TRANSIENT = "transient"
+    RATE_LIMIT = "rate_limit"
+    AUTH = "auth"
+    NODE_UNAVAILABLE = "node_unavailable"
+    REQUEST_MALFORMED = "request_malformed"
+    CAPACITY = "capacity"
+    UNKNOWN = "unknown"
 
 
 def _unwrap(exc: Exception) -> Exception:
@@ -53,7 +115,6 @@ def _status_code_of(exc: Exception) -> int | None:
         value = getattr(exc, attr, None)
         if isinstance(value, int):
             return value
-    # anthropic SDK exposes .response.status_code on APIStatusError
     response = getattr(exc, "response", None)
     status = getattr(response, "status_code", None)
     if isinstance(status, int):
@@ -61,35 +122,53 @@ def _status_code_of(exc: Exception) -> int | None:
     return None
 
 
+CAPACITY_HINTS = (
+    "context length",
+    "context_length",
+    "maximum context",
+    "context window",
+    "too many tokens",
+    "token limit",
+    "prompt is too long",
+    "maximum tokens",
+    "max_tokens",
+)
+
+
 def _looks_like_capacity(message: str) -> bool:
-    """Heuristic: does the error message smell like a context/token overflow?"""
     lowered = message.lower()
-    capacity_hints = (
-        "context length",
-        "context_length",
-        "maximum context",
-        "context window",
-        "too many tokens",
-        "token limit",
-        "prompt is too long",
-        "maximum tokens",
-        "max_tokens",
-    )
-    return any(hint in lowered for hint in capacity_hints)
+    return any(hint in lowered for hint in CAPACITY_HINTS)
 
 
 def classify_error(exc: Exception) -> ErrorCategory:
-    """Classify an exception raised by a provider client.
+    """Classify an exception — custom types first, then SDK duck-typing.
 
-    Duck-typed: works for anthropic.* and openai.* error classes without
-    importing either SDK.
+    Once provider clients normalize their SDK errors to our custom types
+    (Phase 2), this mostly short-circuits on the first isinstance check.
+    The duck-typed fallback remains so escaped SDK errors still land in a
+    sensible bucket.
     """
     exc = _unwrap(exc)
+
+    # Phase 2: custom exception types classify directly.
+    if isinstance(exc, ContextOverflowError):
+        return ErrorCategory.CAPACITY
+    if isinstance(exc, BadRequestError):
+        return ErrorCategory.REQUEST_MALFORMED
+    if isinstance(exc, AuthError):
+        return ErrorCategory.AUTH
+    if isinstance(exc, RateLimitError):
+        return ErrorCategory.RATE_LIMIT
+    if isinstance(exc, NodeUnavailableError):
+        return ErrorCategory.NODE_UNAVAILABLE
+    if isinstance(exc, TransientError):
+        return ErrorCategory.TRANSIENT
+
+    # Fallback: SDK-style duck typing.
     name = type(exc).__name__.lower()
     message = str(exc)
     status = _status_code_of(exc)
 
-    # Explicit status codes take precedence.
     if status is not None:
         if status in (401, 403):
             return ErrorCategory.AUTH
@@ -99,10 +178,6 @@ def classify_error(exc: Exception) -> ErrorCategory:
             return ErrorCategory.CAPACITY if _looks_like_capacity(message) else ErrorCategory.REQUEST_MALFORMED
         if status == 408:
             return ErrorCategory.TRANSIENT
-        # 404/405 are node-local configuration problems (wrong api_base, model
-        # not deployed on this account, stale endpoint). Another pool node
-        # with a different endpoint/model can still serve the request, so
-        # these must be switchable — NOT bundled with 400 malformed-request.
         if status in (404, 405):
             return ErrorCategory.NODE_UNAVAILABLE
         if status >= 500:
@@ -110,7 +185,6 @@ def classify_error(exc: Exception) -> ErrorCategory:
         if 400 <= status < 500:
             return ErrorCategory.REQUEST_MALFORMED
 
-    # Class-name heuristics (fallback when status is unavailable).
     if "authentication" in name or "permissiondenied" in name or "forbidden" in name:
         return ErrorCategory.AUTH
     if "ratelimit" in name:
@@ -127,38 +201,57 @@ def classify_error(exc: Exception) -> ErrorCategory:
     ):
         return ErrorCategory.TRANSIENT
 
-    # Built-in networking errors.
     if isinstance(exc, (TimeoutError, ConnectionError)):
         return ErrorCategory.TRANSIENT
 
     return ErrorCategory.UNKNOWN
 
 
-def is_retryable(category: ErrorCategory) -> bool:
-    """In-node retry eligibility.
+def normalize_sdk_error(exc: Exception) -> Exception:
+    """Translate an SDK exception into the nearest custom exception.
 
-    AUTH, NODE_UNAVAILABLE, and REQUEST_MALFORMED are terminal for the
-    current node — retrying the same call on the same node will fail the
-    same way, so we skip backoff entirely and let the router fail over
-    (when the error is also switchable).
+    Provider clients call this inside their `_make_api_request` method so
+    the rest of the system only deals with `TransientError`,
+    `RateLimitError`, etc. If `exc` is already one of our types it's
+    returned unchanged.
     """
-    return category in (ErrorCategory.TRANSIENT, ErrorCategory.RATE_LIMIT, ErrorCategory.UNKNOWN)
+    if isinstance(exc, LLMError):
+        return exc
+
+    category = classify_error(exc)
+    message = f"{type(exc).__name__}: {exc}"
+
+    mapping = {
+        ErrorCategory.TRANSIENT: TransientError,
+        ErrorCategory.RATE_LIMIT: RateLimitError,
+        ErrorCategory.AUTH: AuthError,
+        ErrorCategory.NODE_UNAVAILABLE: NodeUnavailableError,
+        ErrorCategory.REQUEST_MALFORMED: BadRequestError,
+        ErrorCategory.CAPACITY: ContextOverflowError,
+    }
+    cls = mapping.get(category)
+    if cls is None:
+        # UNKNOWN: treat conservatively as transient so retry/failover
+        # still gets a chance; the original exception rides along as cause.
+        cls = TransientError
+    new_exc = cls(message)
+    new_exc.__cause__ = exc
+    return new_exc
+
+
+def is_retryable(category: ErrorCategory) -> bool:
+    """In-node retry eligibility (category-based, for logging/fallback)."""
+    return category in (ErrorCategory.TRANSIENT, ErrorCategory.UNKNOWN)
 
 
 def is_node_switchable(category: ErrorCategory) -> bool:
     """Whether failing over to another node is appropriate.
 
-    REQUEST_MALFORMED is not switchable: if our request is wrong, no other
-    node will make it right — switching masks the bug (see doc §11 risk 2).
-
-    CAPACITY is not switchable in Phase 1: without capability-aware routing
-    we'd just cycle through nodes with similar windows and burn quota. The
-    caller should compress context first (doc §6.3). Capability-aware
-    capacity failover is Phase 3.
-
-    NODE_UNAVAILABLE (404/405) IS switchable — it's the whole point of
-    having a pool: a node whose endpoint/model is broken for this account
-    should hand off to the next.
+    Phase 2 note: `CAPACITY` now produces `ContextOverflowError` which
+    the router handles on its own path (three-bucket classification +
+    direct raise); `is_node_switchable` still reports False for it,
+    meaning "do not silently failover". `REQUEST_MALFORMED` is also
+    non-switchable (program bug).
     """
     return category in (
         ErrorCategory.TRANSIENT,

@@ -119,7 +119,9 @@ def test_unknown_errors_default_to_unknown() -> None:
     ("category", "expected"),
     [
         (ErrorCategory.TRANSIENT, True),
-        (ErrorCategory.RATE_LIMIT, True),
+        # Phase 2 semantics (design §5.5): rate-limit does NOT retry in-node —
+        # it fails over immediately so the caller picks the next endpoint.
+        (ErrorCategory.RATE_LIMIT, False),
         (ErrorCategory.UNKNOWN, True),
         (ErrorCategory.AUTH, False),
         (ErrorCategory.NODE_UNAVAILABLE, False),

@@ -13,7 +13,7 @@ Features:
 import asyncio
 import functools
 import logging
-from typing import Any, Callable, Type, TypeVar
+from typing import Any, Callable, Optional, Type, TypeVar
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +30,7 @@ class RetryConfig:
         initial_delay: float = 1.0,
         max_delay: float = 60.0,
         exponential_base: float = 2.0,
-        retryable_exceptions: tuple[Type[Exception], ...] = (Exception,),
+        retryable_exceptions: Optional[tuple[Type[Exception], ...]] = None,
     ):
         """
         Args:
@@ -39,13 +39,24 @@ class RetryConfig:
             initial_delay: Initial delay time (seconds)
             max_delay: Maximum delay time (seconds)
             exponential_base: Exponential backoff base
-            retryable_exceptions: Tuple of retryable exception types
+            retryable_exceptions: Tuple of retryable exception types. When
+                omitted defaults to `(TransientError,)` — only genuine
+                network / 5xx hiccups retry. Auth, malformed-request, and
+                capacity errors must NOT be retried (Phase 2 design §5.4).
+                Pass `(Exception,)` explicitly to restore the old
+                "retry everything" behavior.
         """
         self.enabled = enabled
         self.max_retries = max_retries
         self.initial_delay = initial_delay
         self.max_delay = max_delay
         self.exponential_base = exponential_base
+        if retryable_exceptions is None:
+            # Resolve lazily to avoid a circular import between
+            # mini_agent.retry and mini_agent.llm.ha.errors.
+            from .llm.ha.errors import TransientError
+
+            retryable_exceptions = (TransientError,)
         self.retryable_exceptions = retryable_exceptions
 
     def calculate_delay(self, attempt: int) -> float:
