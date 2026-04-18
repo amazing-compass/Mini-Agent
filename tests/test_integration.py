@@ -7,12 +7,60 @@ from pathlib import Path
 
 import pytest
 
-from mini_agent import LLMClient
 from mini_agent.agent import Agent
 from mini_agent.config import Config
+from mini_agent.llm.ha import (
+    ModelNode,
+    ModelPool,
+    ModelRouter,
+    SimpleBreaker,
+    build_client_factory,
+)
 from mini_agent.tools import BashTool, EditTool, ReadTool, WriteTool
 from mini_agent.tools.mcp_loader import load_mcp_tools_async
 from mini_agent.tools.note_tool import RecallNoteTool, SessionNoteTool
+
+
+PLACEHOLDER_KEY = "YOUR_API_KEY_HERE"
+
+
+def _router_from_config(config: Config) -> ModelRouter:
+    """Build a live-traffic router from a parsed Config."""
+    nodes = [
+        ModelNode(
+            node_id=entry.node_id,
+            provider=entry.provider.lower(),
+            protocol_family=(entry.protocol_family or entry.provider).lower(),
+            api_key=entry.api_key or "",
+            api_base=entry.api_base,
+            model=entry.model,
+            priority=entry.priority,
+            weight=entry.weight,
+            context_window=entry.context_window,
+            max_output_tokens=entry.max_output_tokens,
+            supports_tools=entry.supports_tools,
+            supports_thinking=entry.supports_thinking,
+            enabled=entry.enabled,
+        )
+        for entry in config.llm.pool
+    ]
+    pool = ModelPool(nodes, build_client=build_client_factory())
+    breaker = SimpleBreaker(
+        failure_threshold=config.llm.breaker.failure_threshold,
+        cooldown_seconds=config.llm.breaker.cooldown_seconds,
+    )
+    return ModelRouter(
+        pool,
+        breaker,
+        strategy=config.llm.routing.strategy,
+        cross_family_fallback=config.llm.routing.cross_family_fallback,
+    )
+
+
+def _skip_if_no_key(config: Config) -> None:
+    primary_key = config.llm.pool[0].api_key if config.llm.pool else ""
+    if not primary_key or primary_key == PLACEHOLDER_KEY:
+        pytest.skip("API key not configured")
 
 
 @pytest.mark.asyncio
@@ -32,10 +80,7 @@ async def test_basic_agent_usage():
         pytest.skip("config.yaml not found")
 
     config = Config.from_yaml(config_path)
-
-    # Check API key
-    if not config.llm.api_key or config.llm.api_key == "YOUR_MINIMAX_API_KEY_HERE":
-        pytest.skip("API key not configured")
+    _skip_if_no_key(config)
 
     # Use temporary workspace
     with tempfile.TemporaryDirectory() as workspace_dir:
@@ -46,12 +91,7 @@ async def test_basic_agent_usage():
         else:
             system_prompt = "You are a helpful AI assistant."
 
-        # Initialize LLM client
-        llm_client = LLMClient(
-            api_key=config.llm.api_key,
-            api_base=config.llm.api_base,
-            model=config.llm.model,
-        )
+        router = _router_from_config(config)
 
         # Initialize basic tools
         tools = [
@@ -87,7 +127,7 @@ async def test_basic_agent_usage():
 
         # Create agent
         agent = Agent(
-            llm_client=llm_client,
+            router=router,
             system_prompt=system_prompt,
             tools=tools,
             max_steps=config.agent.max_steps,
@@ -136,10 +176,7 @@ async def test_session_memory_demo():
         pytest.skip("config.yaml not found")
 
     config = Config.from_yaml(config_path)
-
-    # Check API key
-    if not config.llm.api_key or config.llm.api_key == "YOUR_MINIMAX_API_KEY_HERE":
-        pytest.skip("API key not configured")
+    _skip_if_no_key(config)
 
     # Use temporary workspace
     with tempfile.TemporaryDirectory() as workspace_dir:
@@ -151,12 +188,7 @@ You have record_note and recall_notes tools:
 - recall_notes: Retrieve saved information
 """
 
-        # Initialize LLM
-        llm_client = LLMClient(
-            api_key=config.llm.api_key,
-            api_base=config.llm.api_base,
-            model=config.llm.model,
-        )
+        router = _router_from_config(config)
 
         # Memory file path
         memory_file = Path(workspace_dir) / ".agent_memory.json"
@@ -169,7 +201,7 @@ You have record_note and recall_notes tools:
 
         print("\n📝 Creating Agent with Session Note tools...")
         agent = Agent(
-            llm_client=llm_client,
+            router=router,
             system_prompt=system_prompt,
             tools=tools,
             max_steps=8,  # Reduced from 15
@@ -213,7 +245,7 @@ You have record_note and recall_notes tools:
 
         # Task 2: New conversation - agent should recall memories
         agent2 = Agent(
-            llm_client=llm_client,
+            router=router,
             system_prompt=system_prompt,
             tools=tools,
             max_steps=5,  # Reduced from 10

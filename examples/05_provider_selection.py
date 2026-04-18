@@ -1,39 +1,44 @@
-"""Example: Using LLMClient with different providers.
+"""Example 5: Talking to Providers Directly
 
-This example demonstrates how to use the LLMClient wrapper with different
-LLM providers (Anthropic or OpenAI) through the provider parameter.
+Phase 3 removed the `LLMClient` facade. This demo shows the two paths
+that replaced it:
+
+1. `build_direct_client(config, LLMProvider.X)` — pull credentials from
+   the first matching pool entry and instantiate a provider client
+   (Anthropic or OpenAI) for one-shot requests.
+2. `build_router(config)` — the router wraps the whole pool and hands
+   Agent a unified interface; a direct client is what you want when the
+   router's breaker/failover semantics would be overkill.
+
+MiniMax serves both protocols from the same credentials, so the pool
+usually only carries `provider: anthropic` nodes and the OpenAI demo
+still works by pointing at the `/v1` suffix. If your pool contains an
+explicit `provider: openai` node, that node's key is used instead.
 """
 
 import asyncio
-from pathlib import Path
 
-import yaml
+from _common import build_direct_client, load_config
 
-from mini_agent import LLMClient, LLMProvider, Message
+from mini_agent.schema import LLMProvider, Message
 
 
 async def demo_anthropic_provider():
-    """Demo using LLMClient with Anthropic provider."""
+    """Demo: raw AnthropicClient."""
     print("\n" + "=" * 60)
-    print("DEMO: LLMClient with Anthropic Provider")
+    print("DEMO: AnthropicClient (Messages API)")
     print("=" * 60)
 
-    # Load config
-    config_path = Path("mini_agent/config/config.yaml")
-    with open(config_path, encoding="utf-8") as f:
-        config = yaml.safe_load(f)
+    config = load_config()
+    if config is None:
+        return
 
-    # Initialize client with Anthropic provider
-    client = LLMClient(
-        api_key=config["api_key"],
-        provider=LLMProvider.ANTHROPIC,  # Specify Anthropic provider
-        model=config.get("model", "MiniMax-M2.5"),
-    )
+    client = build_direct_client(config, LLMProvider.ANTHROPIC)
 
-    print(f"Provider: {client.provider}")
+    print(f"Provider: anthropic")
     print(f"API Base: {client.api_base}")
+    print(f"Model:    {client.model}")
 
-    # Simple question
     messages = [Message(role="user", content="Say 'Hello from Anthropic!'")]
     print(f"\n👤 User: {messages[0].content}")
 
@@ -48,27 +53,21 @@ async def demo_anthropic_provider():
 
 
 async def demo_openai_provider():
-    """Demo using LLMClient with OpenAI provider."""
+    """Demo: raw OpenAIClient."""
     print("\n" + "=" * 60)
-    print("DEMO: LLMClient with OpenAI Provider")
+    print("DEMO: OpenAIClient (Chat Completions API)")
     print("=" * 60)
 
-    # Load config
-    config_path = Path("mini_agent/config/config.yaml")
-    with open(config_path, encoding="utf-8") as f:
-        config = yaml.safe_load(f)
+    config = load_config()
+    if config is None:
+        return
 
-    # Initialize client with OpenAI provider
-    client = LLMClient(
-        api_key=config["api_key"],
-        provider=LLMProvider.OPENAI,  # Specify OpenAI provider
-        model=config.get("model", "MiniMax-M2.5"),
-    )
+    client = build_direct_client(config, LLMProvider.OPENAI)
 
-    print(f"Provider: {client.provider}")
+    print(f"Provider: openai")
     print(f"API Base: {client.api_base}")
+    print(f"Model:    {client.model}")
 
-    # Simple question
     messages = [Message(role="user", content="Say 'Hello from OpenAI!'")]
     print(f"\n👤 User: {messages[0].content}")
 
@@ -82,72 +81,26 @@ async def demo_openai_provider():
         print(f"❌ Error: {e}")
 
 
-async def demo_default_provider():
-    """Demo using LLMClient with default provider."""
-    print("\n" + "=" * 60)
-    print("DEMO: LLMClient with Default Provider (Anthropic)")
-    print("=" * 60)
-
-    # Load config
-    config_path = Path("mini_agent/config/config.yaml")
-    with open(config_path, encoding="utf-8") as f:
-        config = yaml.safe_load(f)
-
-    # Initialize client without specifying provider (defaults to Anthropic)
-    client = LLMClient(
-        api_key=config["api_key"],
-        model=config.get("model", "MiniMax-M2.5"),
-    )
-
-    print(f"Provider (default): {client.provider}")
-    print(f"API Base: {client.api_base}")
-
-    # Simple question
-    messages = [Message(role="user", content="Say 'Hello with default provider!'")]
-    print(f"\n👤 User: {messages[0].content}")
-
-    try:
-        response = await client.generate(messages)
-        print(f"💬 Model: {response.content}")
-        print("✅ Default provider demo completed")
-    except Exception as e:
-        print(f"❌ Error: {e}")
-
-
 async def demo_provider_comparison():
-    """Compare responses from both providers."""
+    """Compare responses from both providers on the same prompt."""
     print("\n" + "=" * 60)
     print("DEMO: Provider Comparison")
     print("=" * 60)
 
-    # Load config
-    config_path = Path("mini_agent/config/config.yaml")
-    with open(config_path, encoding="utf-8") as f:
-        config = yaml.safe_load(f)
+    config = load_config()
+    if config is None:
+        return
 
-    # Create clients for both providers
-    anthropic_client = LLMClient(
-        api_key=config["api_key"],
-        provider=LLMProvider.ANTHROPIC,
-        model=config.get("model", "MiniMax-M2.5"),
-    )
+    anthropic_client = build_direct_client(config, LLMProvider.ANTHROPIC)
+    openai_client = build_direct_client(config, LLMProvider.OPENAI)
 
-    openai_client = LLMClient(
-        api_key=config["api_key"],
-        provider=LLMProvider.OPENAI,
-        model=config.get("model", "MiniMax-M2.5"),
-    )
-
-    # Same question for both
     messages = [Message(role="user", content="What is 2+2?")]
     print(f"\n👤 Question: {messages[0].content}\n")
 
     try:
-        # Get response from Anthropic
         anthropic_response = await anthropic_client.generate(messages)
         print(f"🔵 Anthropic: {anthropic_response.content}")
 
-        # Get response from OpenAI
         openai_response = await openai_client.generate(messages)
         print(f"🟢 OpenAI: {openai_response.content}")
 
@@ -158,21 +111,14 @@ async def demo_provider_comparison():
 
 async def main():
     """Run all demos."""
-    print("\n🚀 LLM Provider Selection Demo")
-    print("This demo shows how to use LLMClient with different providers.")
-    print("Make sure you have configured API key in config.yaml.")
+    print("\n🚀 Provider Selection Demo (Phase 3)")
+    print("This demo shows how to instantiate provider-specific clients")
+    print("from a Phase 3 pool-based config.")
+    print("Make sure you have configured an API key in config.yaml.")
 
     try:
-        # Demo default provider
-        await demo_default_provider()
-
-        # Demo Anthropic provider
         await demo_anthropic_provider()
-
-        # Demo OpenAI provider
         await demo_openai_provider()
-
-        # Demo provider comparison
         await demo_provider_comparison()
 
         print("\n✅ All demos completed successfully!")

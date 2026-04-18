@@ -1,7 +1,10 @@
 """Example 3: Session Note Tool Usage
 
-This example demonstrates the Session Note Tool - one of the core features
-that allows agents to maintain memory across sessions.
+Demonstrates the Session Note Tool — the feature that lets agents
+maintain memory across sessions.
+
+Phase 3: Agent uses a `ModelRouter` instead of the removed `LLMClient`
+facade; router construction is hidden in `examples/_common.py`.
 
 Based on: tests/test_note_tool.py, tests/test_integration.py
 """
@@ -11,9 +14,9 @@ import json
 import tempfile
 from pathlib import Path
 
-from mini_agent import LLMClient
+from _common import build_router, load_config, load_system_prompt
+
 from mini_agent.agent import Agent
-from mini_agent.config import Config
 from mini_agent.tools import BashTool, ReadTool, WriteTool
 from mini_agent.tools.note_tool import RecallNoteTool, SessionNoteTool
 
@@ -28,11 +31,9 @@ async def demo_direct_note_usage():
         note_file = f.name
 
     try:
-        # Create tools
         record_tool = SessionNoteTool(memory_file=note_file)
         recall_tool = RecallNoteTool(memory_file=note_file)
 
-        # Record some notes
         print("\n📝 Recording notes...")
 
         result = await record_tool.execute(
@@ -53,17 +54,14 @@ async def demo_direct_note_usage():
         )
         print(f"  ✓ {result.content}")
 
-        # Recall all notes
         print("\n🔍 Recalling all notes...")
         result = await recall_tool.execute()
         print(result.content)
 
-        # Recall filtered notes
         print("\n🔍 Recalling user preferences only...")
         result = await recall_tool.execute(category="user_preference")
         print(result.content)
 
-        # Show the memory file
         print("\n📄 Memory file content:")
         print("=" * 60)
         notes = json.loads(Path(note_file).read_text())
@@ -80,29 +78,18 @@ async def demo_agent_with_notes():
     print("Demo 2: Agent with Session Memory")
     print("=" * 60)
 
-    # Load configuration
-    config_path = Path("mini_agent/config/config.yaml")
-    if not config_path.exists():
-        print("❌ config.yaml not found")
+    config = load_config()
+    if config is None:
         return
-
-    config = Config.from_yaml(config_path)
-
-    if not config.llm.api_key or config.llm.api_key.startswith("YOUR_"):
-        print("❌ API key not configured")
-        return
+    router = build_router(config)
 
     with tempfile.TemporaryDirectory() as workspace_dir:
         print(f"📁 Workspace: {workspace_dir}\n")
 
-        # Load system prompt (Agent will auto-inject workspace info)
-        system_prompt_path = Path("mini_agent/config/system_prompt.md")
-        if system_prompt_path.exists():
-            system_prompt = system_prompt_path.read_text(encoding="utf-8")
-        else:
-            system_prompt = "You are a helpful AI assistant."
+        system_prompt = load_system_prompt(
+            fallback="You are a helpful AI assistant.",
+        )
 
-        # Add Session Note instructions
         note_instructions = """
 
 IMPORTANT - Session Note Management:
@@ -117,17 +104,8 @@ Guidelines:
 """
         system_prompt += note_instructions
 
-        # Initialize LLM
-        llm_client = LLMClient(
-            api_key=config.llm.api_key,
-            api_base=config.llm.api_base,
-            model=config.llm.model,
-        )
-
-        # Memory file
         memory_file = Path(workspace_dir) / ".agent_memory.json"
 
-        # Tools including Session Note tools
         tools = [
             ReadTool(workspace_dir=workspace_dir),
             WriteTool(workspace_dir=workspace_dir),
@@ -142,7 +120,7 @@ Guidelines:
         print("=" * 60)
 
         agent1 = Agent(
-            llm_client=llm_client,
+            router=router,
             system_prompt=system_prompt,
             tools=tools,
             max_steps=15,
@@ -174,7 +152,6 @@ Guidelines:
             print(result1)
             print("=" * 60)
 
-            # Check memory file
             if memory_file.exists():
                 notes = json.loads(memory_file.read_text())
                 print(f"\n✅ Agent recorded {len(notes)} notes in memory")
@@ -193,7 +170,7 @@ Guidelines:
         print("=" * 60)
 
         agent2 = Agent(
-            llm_client=llm_client,
+            router=router,
             system_prompt=system_prompt,
             tools=tools,
             max_steps=10,
@@ -236,7 +213,6 @@ async def main():
     print("\nSession Notes allow agents to remember context across sessions.")
     print("This is a key feature for building production-ready agents.\n")
 
-    # Run demos
     await demo_direct_note_usage()
     print("\n" * 2)
     await demo_agent_with_notes()

@@ -1,10 +1,12 @@
 """Example 4: Full Agent with All Features
 
-This example demonstrates a complete agent setup with:
+Demonstrates a complete agent setup with:
 - All basic tools (Read, Write, Edit, Bash)
 - Session Note tools for memory
 - MCP tools (Memory, Search, etc.)
-- Skills integration
+
+Phase 3: Agent owns a `ModelRouter` directly. Router construction is
+shared via `examples/_common.py`.
 
 Based on: tests/test_integration.py
 """
@@ -13,9 +15,9 @@ import asyncio
 import tempfile
 from pathlib import Path
 
-from mini_agent import LLMClient
+from _common import build_router, load_config, load_system_prompt
+
 from mini_agent.agent import Agent
-from mini_agent.config import Config
 from mini_agent.tools import BashTool, EditTool, ReadTool, WriteTool
 from mini_agent.tools.mcp_loader import load_mcp_tools_async
 from mini_agent.tools.note_tool import RecallNoteTool, SessionNoteTool
@@ -27,32 +29,18 @@ async def demo_full_agent():
     print("Full Mini Agent - All Features Enabled")
     print("=" * 60)
 
-    # Load configuration
-    config_path = Path("mini_agent/config/config.yaml")
-    if not config_path.exists():
-        print("❌ config.yaml not found. Please run:")
-        print("   cp mini_agent/config/config-example.yaml mini_agent/config/config.yaml")
+    config = load_config()
+    if config is None:
         return
+    router = build_router(config)
 
-    config = Config.from_yaml(config_path)
-
-    # Check API key
-    if not config.llm.api_key or config.llm.api_key.startswith("YOUR_"):
-        print("❌ API key not configured in config.yaml")
-        return
-
-    # Create workspace
     with tempfile.TemporaryDirectory() as workspace_dir:
         print(f"📁 Workspace: {workspace_dir}")
 
-        # Load system prompt (Agent will auto-inject workspace info)
-        system_prompt_path = Path("mini_agent/config/system_prompt.md")
-        if system_prompt_path.exists():
-            system_prompt = system_prompt_path.read_text(encoding="utf-8")
-        else:
-            system_prompt = "You are a helpful AI assistant."
+        system_prompt = load_system_prompt(
+            fallback="You are a helpful AI assistant.",
+        )
 
-        # Add Session Note instructions
         note_instructions = """
 
 IMPORTANT - Session Memory:
@@ -62,14 +50,6 @@ You have record_note and recall_notes tools. Use them to:
 """
         system_prompt += note_instructions
 
-        # Initialize LLM
-        llm_client = LLMClient(
-            api_key=config.llm.api_key,
-            api_base=config.llm.api_base,
-            model=config.llm.model,
-        )
-
-        # Initialize basic tools
         tools = [
             ReadTool(workspace_dir=workspace_dir),
             WriteTool(workspace_dir=workspace_dir),
@@ -78,7 +58,6 @@ You have record_note and recall_notes tools. Use them to:
         ]
         print("✓ Loaded 4 basic tools")
 
-        # Add Session Note tools
         memory_file = Path(workspace_dir) / ".agent_memory.json"
         tools.extend(
             [
@@ -88,7 +67,6 @@ You have record_note and recall_notes tools. Use them to:
         )
         print("✓ Loaded 2 Session Note tools")
 
-        # Load MCP tools (if configured)
         try:
             mcp_tools = await load_mcp_tools_async(config_path="mini_agent/config/mcp.json")
             if mcp_tools:
@@ -99,9 +77,8 @@ You have record_note and recall_notes tools. Use them to:
         except Exception as e:
             print(f"⚠️  MCP tools not loaded: {e}")
 
-        # Create agent
         agent = Agent(
-            llm_client=llm_client,
+            router=router,
             system_prompt=system_prompt,
             tools=tools,
             max_steps=config.agent.max_steps,
@@ -110,7 +87,6 @@ You have record_note and recall_notes tools. Use them to:
 
         print(f"\n🤖 Agent created with {len(tools)} total tools\n")
 
-        # Task: Complex task that uses multiple tools
         task = """
         Please help me with the following tasks:
 
@@ -149,7 +125,6 @@ You have record_note and recall_notes tools. Use them to:
             print("=" * 60)
             print(f"\nAgent's final response:\n{result}\n")
 
-            # Show created files
             print("=" * 60)
             print("📄 Created files in workspace:")
             print("=" * 60)
@@ -160,14 +135,12 @@ You have record_note and recall_notes tools. Use them to:
                     print(f"\n📄 {file.name}:")
                     print("-" * 60)
                     content = file.read_text()
-                    # Show first 20 lines
                     lines = content.split("\n")[:20]
                     print("\n".join(lines))
                     if len(content.split("\n")) > 20:
                         print("... (truncated)")
                     print("-" * 60)
 
-            # Show memory
             if memory_file.exists():
                 import json
 
@@ -184,34 +157,19 @@ You have record_note and recall_notes tools. Use them to:
 
 
 async def demo_interactive_mode():
-    """Demo: Interactive conversation with agent."""
+    """Demo: Multi-turn conversation with agent."""
     print("\n" + "=" * 60)
     print("Interactive Mini Agent")
     print("=" * 60)
     print("\nThis demo shows multi-turn conversation.")
     print("(In production, use `mini-agent` for full interactive mode)")
 
-    # Load config
-    config_path = Path("mini_agent/config/config.yaml")
-    if not config_path.exists():
-        print("❌ config.yaml not found")
+    config = load_config()
+    if config is None:
         return
-
-    config = Config.from_yaml(config_path)
-
-    if not config.llm.api_key or config.llm.api_key.startswith("YOUR_"):
-        print("❌ API key not configured")
-        return
+    router = build_router(config)
 
     with tempfile.TemporaryDirectory() as workspace_dir:
-        # Setup
-        system_prompt = "You are a helpful assistant with access to tools."
-        llm_client = LLMClient(
-            api_key=config.llm.api_key,
-            api_base=config.llm.api_base,
-            model=config.llm.model,
-        )
-
         tools = [
             WriteTool(workspace_dir=workspace_dir),
             ReadTool(workspace_dir=workspace_dir),
@@ -219,14 +177,13 @@ async def demo_interactive_mode():
         ]
 
         agent = Agent(
-            llm_client=llm_client,
-            system_prompt=system_prompt,
+            router=router,
+            system_prompt="You are a helpful assistant with access to tools.",
             tools=tools,
             max_steps=20,
             workspace_dir=workspace_dir,
         )
 
-        # Conversation turns
         conversations = [
             "Create a file called 'data.txt' with the numbers 1 to 5, one per line.",
             "Now read the file and tell me what's in it.",
@@ -260,7 +217,6 @@ async def main():
     print("- MCP tools (if configured)")
     print("- Multi-turn conversations\n")
 
-    # Run demos
     await demo_full_agent()
     print("\n" * 2)
     await demo_interactive_mode()

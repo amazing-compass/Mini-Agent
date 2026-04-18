@@ -56,9 +56,16 @@ class RoutingConfig(BaseModel):
     breaker is the authoritative owner of node health state (design
     §5.8). Keeping the field here would be a dead option that silently
     changes semantics for anyone still setting it.
+
+    Phase 3 adds `cross_family_fallback`: when True, after every node in
+    the current protocol family has failed the router bridges `messages`
+    to a node from the other family (stripping `thinking` blocks and
+    cleaning up orphan `tool_use` references first). Default False keeps
+    Phase 2's same-family-only behavior. Design §6.
     """
 
     strategy: str = "priority"  # Phase 1 only implements priority
+    cross_family_fallback: bool = False  # Phase 3: opt-in cross-family hop
 
 
 class BreakerConfig(BaseModel):
@@ -88,17 +95,14 @@ class ModelNodeConfig(BaseModel):
 
 
 class LLMConfig(BaseModel):
-    """LLM configuration. Always exposes a `pool` (1..N nodes).
+    """LLM configuration — Phase 3 is pool-only.
 
-    For backward compat the first node's credentials are also surfaced as
-    top-level `api_key` / `api_base` / `model` / `provider` attributes so
-    existing call sites keep working.
+    The deleted `LLMClient` facade used to surface the primary node's
+    credentials as top-level `api_key` / `api_base` / `model` /
+    `provider` attributes; those are gone now. Everyone reads from
+    `pool` directly.
     """
 
-    api_key: str
-    api_base: str = "https://api.minimax.io"
-    model: str = "MiniMax-M2.5"
-    provider: str = "anthropic"
     retry: RetryConfig = Field(default_factory=RetryConfig)
     routing: RoutingConfig = Field(default_factory=RoutingConfig)
     breaker: BreakerConfig = Field(default_factory=BreakerConfig)
@@ -106,10 +110,17 @@ class LLMConfig(BaseModel):
 
 
 class AgentConfig(BaseModel):
-    """Agent configuration"""
+    """Agent configuration.
+
+    `workspace_dir` defaults to `None` (not `"./workspace"`) so callers —
+    the CLI in particular — can distinguish "user didn't configure one"
+    from "user explicitly chose ./workspace". When unset, the CLI falls
+    back to the current working directory, preserving the pre-Phase-3
+    default experience for users who never touched the config.
+    """
 
     max_steps: int = 50
-    workspace_dir: str = "./workspace"
+    workspace_dir: str | None = None
     system_prompt_path: str = "system_prompt.md"
 
 
@@ -175,6 +186,7 @@ def _build_routing_config(data: dict[str, Any]) -> RoutingConfig:
         )
     return RoutingConfig(
         strategy=data.get("strategy", "priority"),
+        cross_family_fallback=bool(data.get("cross_family_fallback", False)),
     )
 
 
@@ -259,11 +271,10 @@ class Config(BaseModel):
     def from_yaml(cls, config_path: str | Path) -> "Config":
         """Load configuration from YAML file.
 
-        Accepts either the legacy flat shape (api_key/api_base/model/provider
-        at the top level) or the new pool shape (pool/routing under `llm:`).
-        Both can coexist: if `pool` is present it wins for routing and the
-        legacy top-level fields are only used to surface a "primary" view
-        for backward compat.
+        Phase 3 requires the pool shape (`pool: [...]`). The legacy flat
+        shape (top-level `api_key` / `api_base` / `model` / `provider`)
+        was removed along with the `LLMClient` facade — see design
+        §13.7 step 8 and §10 "不做向后兼容".
         """
         config_path = Path(config_path)
 
@@ -277,6 +288,19 @@ class Config(BaseModel):
             raise ValueError("Configuration file is empty")
 
         llm_section: dict[str, Any] = data.get("llm") if isinstance(data.get("llm"), dict) else {}
+
+        # Reject legacy flat fields loudly. Design §13.7 step 8 retires
+        # the "synthesize a one-node pool from api_key/api_base/model"
+        # code path; keeping it silently working would drift from the
+        # authoritative `pool:` shape the rest of the codebase expects.
+        _LEGACY_FLAT_FIELDS = ("api_key", "api_base", "model", "provider", "api_key_env")
+        legacy_hits = [f for f in _LEGACY_FLAT_FIELDS if f in data]
+        if legacy_hits:
+            raise ValueError(
+                "Top-level LLM fields are no longer supported — migrate to a "
+                f"`pool: [...]` block. Offending fields: {sorted(legacy_hits)}. "
+                "See config-example.yaml for the new shape."
+            )
 
         # Pool can live under `llm.pool` or top-level `pool` (YAML flexibility).
         pool_raw = llm_section.get("pool") if llm_section else None
@@ -292,56 +316,43 @@ class Config(BaseModel):
         routing_config = _build_routing_config(routing_raw)
         breaker_config = _build_breaker_config(breaker_raw)
 
-        pool_entries = _build_pool_entries(pool_raw or [])
+        if not pool_raw:
+            raise ValueError(
+                "Configuration file missing `pool: [...]`. Phase 3 is pool-only; "
+                "see config-example.yaml."
+            )
 
-        # If no pool was provided, synthesize one from the legacy flat fields.
-        if not pool_entries:
-            if "api_key" not in data:
-                raise ValueError("Configuration file missing required field: api_key (or pool: [...] )")
-            legacy_api_key = _resolve_api_key(data.get("api_key"), data.get("api_key_env"))
-            legacy_provider = data.get("provider", "anthropic")
-            pool_entries = [
-                ModelNodeConfig(
-                    node_id="default",
-                    provider=legacy_provider,
-                    protocol_family=legacy_provider,
-                    api_key=legacy_api_key,
-                    api_base=data.get("api_base", "https://api.minimax.io"),
-                    model=data.get("model", "MiniMax-M2.5"),
-                    priority=100,
-                )
-            ]
-        else:
-            pool_entries = _resolve_pool_keys(pool_entries)
-
-        # Legacy consumers (e.g. acp/) still read config.llm.api_key /
-        # api_base / model. Mirror whatever the router would actually pick
-        # FIRST so these compat fields never diverge from real routing.
-        # Router sort key: (-priority, node_id) ascending → we pick the
-        # same tuple via min(). Fall back to pool_entries[0] only when
-        # every node is disabled.
-        enabled_entries = [e for e in pool_entries if e.enabled]
-        if enabled_entries:
-            primary = min(enabled_entries, key=lambda e: (-e.priority, e.node_id))
-        else:
-            primary = pool_entries[0]
+        pool_entries = _build_pool_entries(pool_raw)
+        pool_entries = _resolve_pool_keys(pool_entries)
 
         llm_config = LLMConfig(
-            api_key=primary.api_key or "",
-            api_base=primary.api_base,
-            model=primary.model,
-            provider=primary.provider,
             retry=retry_config,
             routing=routing_config,
             breaker=breaker_config,
             pool=pool_entries,
         )
 
-        # Parse Agent configuration
+        # Parse Agent configuration.
+        #
+        # Blessed form is a nested `agent:` block (matches the dataclass
+        # shape callers use at runtime via `config.agent.max_steps`).
+        # Top-level `max_steps` / `workspace_dir` / `system_prompt_path`
+        # stay as a legacy shim — same leniency we apply to retry /
+        # routing / breaker above — but when BOTH forms appear the
+        # nested block wins so users get what they wrote.
+        agent_raw: dict[str, Any] = data.get("agent") if isinstance(data.get("agent"), dict) else {}
+        defaults = AgentConfig()
         agent_config = AgentConfig(
-            max_steps=data.get("max_steps", 50),
-            workspace_dir=data.get("workspace_dir", "./workspace"),
-            system_prompt_path=data.get("system_prompt_path", "system_prompt.md"),
+            max_steps=agent_raw.get(
+                "max_steps", data.get("max_steps", defaults.max_steps)
+            ),
+            workspace_dir=agent_raw.get(
+                "workspace_dir", data.get("workspace_dir", defaults.workspace_dir)
+            ),
+            system_prompt_path=agent_raw.get(
+                "system_prompt_path",
+                data.get("system_prompt_path", defaults.system_prompt_path),
+            ),
         )
 
         # Parse tools configuration

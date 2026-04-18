@@ -27,10 +27,15 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style
 
-from mini_agent import LLMClient
 from mini_agent.agent import Agent
 from mini_agent.config import Config
-from mini_agent.llm.ha import ModelNode
+from mini_agent.llm.ha import (
+    ModelNode,
+    ModelPool,
+    ModelRouter,
+    SimpleBreaker,
+    build_client_factory,
+)
 from mini_agent.tools.base import Tool
 from mini_agent.tools.bash_tool import BashKillTool, BashOutputTool, BashTool
 from mini_agent.tools.file_tools import EditTool, ReadTool, WriteTool
@@ -557,10 +562,10 @@ async def run_agent(workspace_dir: Path, task: str = None):
         next_delay = retry_config.calculate_delay(attempt - 1)
         print(f"{Colors.DIM}   Retrying in {next_delay:.1f}s (attempt {attempt + 1})...{Colors.RESET}")
 
-    # Build model nodes from the pool config. URL normalization (MiniMax
-    # suffix auto-append) is handled inside LLMClient._get_or_create_client
-    # — we pass api_base through verbatim so both CLI and direct
-    # `LLMClient.from_nodes(...)` users get identical behavior.
+    # Build model nodes from the pool config. `build_client_factory` is
+    # the one place that normalizes MiniMax URLs and injects per-node
+    # `default_max_tokens`, so CLI stays a thin assembler (design §4.3
+    # + §13.7 step 1).
     nodes: list[ModelNode] = []
     for entry in config.llm.pool:
         provider_str = entry.provider.lower()
@@ -582,18 +587,28 @@ async def run_agent(workspace_dir: Path, task: str = None):
             )
         )
 
-    llm_client = LLMClient.from_nodes(
-        nodes=nodes,
-        retry_config=retry_config if config.llm.retry.enabled else None,
-        strategy=config.llm.routing.strategy,
+    effective_retry_config = retry_config if config.llm.retry.enabled else None
+    build_client = build_client_factory(retry_config=effective_retry_config)
+    pool = ModelPool(nodes, build_client=build_client)
+    breaker = SimpleBreaker(
         failure_threshold=config.llm.breaker.failure_threshold,
         cooldown_seconds=config.llm.breaker.cooldown_seconds,
     )
+    router = ModelRouter(
+        pool,
+        breaker,
+        strategy=config.llm.routing.strategy,
+        cross_family_fallback=config.llm.routing.cross_family_fallback,
+    )
 
-    # Set retry callback
+    # Retry notifications travel through each node's provider client.
     if config.llm.retry.enabled:
-        llm_client.retry_callback = on_retry
-        print(f"{Colors.GREEN}✅ LLM retry mechanism enabled (max {config.llm.retry.max_retries} retries){Colors.RESET}")
+        for node in pool.enabled():
+            pool.get_client(node.node_id).retry_callback = on_retry
+        print(
+            f"{Colors.GREEN}✅ LLM retry mechanism enabled (max "
+            f"{config.llm.retry.max_retries} retries){Colors.RESET}"
+        )
 
     # Observability: announce pool composition + failover events
     if len(nodes) > 1:
@@ -601,8 +616,8 @@ async def run_agent(workspace_dir: Path, task: str = None):
             f"{n.node_id}(p={n.priority},{n.provider},{n.model})" for n in nodes
         )
         print(
-            f"{Colors.GREEN}✅ LLM pool ready: {len(nodes)} nodes, strategy={config.llm.routing.strategy} "
-            f"[{node_summary}]{Colors.RESET}"
+            f"{Colors.GREEN}✅ LLM pool ready: {len(nodes)} nodes, strategy="
+            f"{config.llm.routing.strategy} [{node_summary}]{Colors.RESET}"
         )
 
         def on_failover(failed_node, next_node, exc, category):
@@ -612,7 +627,7 @@ async def run_agent(workspace_dir: Path, task: str = None):
                 f"{failed_node.node_id} → {next_node.node_id}: {exc}"
             )
 
-        llm_client.on_failover = on_failover
+        router.on_failover = on_failover
 
     # 3. Initialize base tools (independent of workspace)
     tools, skill_loader = await initialize_base_tools(config)
@@ -648,10 +663,10 @@ async def run_agent(workspace_dir: Path, task: str = None):
     # × 0.8 — a conservative floor so compression fires before any node
     # in the pool overflows, regardless of which one the router lands on.
     # Agent stays blissfully unaware of the NodePool itself (design §7.3).
-    pool_windows = llm_client.pool.all_context_windows()
+    pool_windows = pool.all_context_windows()
     token_limit = int(min(pool_windows) * 0.8) if pool_windows else 80000
     agent = Agent(
-        llm_client=llm_client,
+        router=router,
         system_prompt=system_prompt,
         tools=tools,
         max_steps=config.agent.max_steps,
@@ -664,9 +679,16 @@ async def run_agent(workspace_dir: Path, task: str = None):
         agent.load_pinned_notes(str(workspace_dir / ".agent_memory.json"))
 
     # 8. Display welcome information
+    # Primary model = highest-priority enabled pool node (tie-break by node_id).
+    enabled_nodes = pool.enabled()
+    primary_node = (
+        min(enabled_nodes, key=lambda n: (-n.priority, n.node_id))
+        if enabled_nodes
+        else nodes[0]
+    )
     if not task:
         print_banner()
-        print_session_info(agent, workspace_dir, config.llm.model)
+        print_session_info(agent, workspace_dir, primary_node.model)
 
     # 8.5 Non-interactive mode: execute task and exit
     if task:
@@ -895,6 +917,39 @@ async def run_agent(workspace_dir: Path, task: str = None):
     await _quiet_cleanup()
 
 
+def resolve_workspace_dir(
+    cli_workspace: str | None,
+    *,
+    config_loader=Config.load,
+) -> Path:
+    """Pick the workspace directory for this invocation.
+
+    Priority order (first non-empty wins):
+      1. `--workspace` CLI flag  (explicit override by the user)
+      2. `agent.workspace_dir` from the loaded config  (user preference)
+      3. current working directory  (zero-config fallback — preserves
+         pre-Phase-3 behavior for users who never touched the config)
+
+    `config_loader` is injected so tests can exercise each branch without
+    depending on a real config.yaml on disk. Config load failures are
+    swallowed here on purpose — the main `run_agent` call will re-raise
+    them with the right context shortly after.
+    """
+    if cli_workspace:
+        return Path(cli_workspace).expanduser().absolute()
+
+    config_ws: str | None = None
+    try:
+        config_ws = config_loader().agent.workspace_dir
+    except Exception:
+        config_ws = None
+
+    if config_ws:
+        return Path(config_ws).expanduser().absolute()
+
+    return Path.cwd()
+
+
 def main():
     """Main entry point for CLI"""
     # Parse command line arguments
@@ -908,13 +963,7 @@ def main():
             show_log_directory(open_file_manager=True)
         return
 
-    # Determine workspace directory
-    # Expand ~ to user home directory for portability
-    if args.workspace:
-        workspace_dir = Path(args.workspace).expanduser().absolute()
-    else:
-        # Use current working directory
-        workspace_dir = Path.cwd()
+    workspace_dir = resolve_workspace_dir(args.workspace)
 
     # Ensure workspace directory exists
     workspace_dir.mkdir(parents=True, exist_ok=True)

@@ -1,11 +1,14 @@
 """Tests for Agent._generate_with_overflow_recovery.
 
-These regression tests use a FakeLLMClient so no real traffic is needed.
+These regression tests use a FakeRouter so no real traffic is needed.
 The goal is to pin the exact behavior Codex flagged: a ContextOverflow
 raised by the router must *actually* trigger compression, even when the
 agent's local `_estimate_tokens()` happens to be below `token_limit`
 (most commonly because large tool schemas are invisible to that
 estimator).
+
+Phase 3 updated the Agent constructor to take `router=` directly, so
+the fake now speaks the router's `call` / `internal_call` surface.
 """
 
 from __future__ import annotations
@@ -20,10 +23,10 @@ from mini_agent.llm.ha.errors import ContextOverflowError
 from mini_agent.schema import LLMResponse, Message
 
 
-class FakeLLMClient:
-    """Scriptable LLM client: first call overflows, second call succeeds.
+class FakeRouter:
+    """Scriptable router: first call overflows, second call succeeds.
 
-    Only implements the parts Agent touches: `generate()` and the
+    Only implements the parts Agent touches: `call()` and the
     `internal_call()` bypass used by L4 summaries.
     """
 
@@ -32,7 +35,7 @@ class FakeLLMClient:
         self._overflow_times = overflow_times
         self.internal_calls = 0
 
-    async def generate(self, messages, tools=None):
+    async def call(self, messages, tools=None):
         self._generate_calls += 1
         if self._generate_calls <= self._overflow_times:
             raise ContextOverflowError("router pre-flight: no healthy node fits")
@@ -64,9 +67,13 @@ class FakeLLMClient:
         return self._generate_calls
 
 
-def _make_agent(workspace: str, token_limit: int, fake: FakeLLMClient) -> Agent:
+# Back-compat alias so existing assertions naming FakeLLMClient keep reading cleanly.
+FakeLLMClient = FakeRouter
+
+
+def _make_agent(workspace: str, token_limit: int, fake: FakeRouter) -> Agent:
     return Agent(
-        llm_client=fake,  # duck-typed, Agent only reads `.generate` / `.internal_call`
+        router=fake,  # duck-typed, Agent only reads `.call` / `.internal_call`
         system_prompt="You are a test agent.",
         tools=[],
         max_steps=1,

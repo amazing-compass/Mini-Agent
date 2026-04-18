@@ -48,9 +48,12 @@ class LLMClientBase(ABC):
 
         # Callback for tracking retry count
         self.retry_callback = None
-        # Optional predicate used by the retry decorator to skip retries for
-        # non-retryable errors (e.g. auth, malformed-request). Set by the
-        # pool-aware LLMClient wrapper; left as None for standalone usage.
+        # Phase 3 removed the `should_retry` double-insurance: the default
+        # `retryable_exceptions=(TransientError,)` is narrow enough on its
+        # own, and the provider-side `normalize_sdk_error` guarantees that
+        # anything reaching the retry decorator is already classified.
+        # The attribute is kept on the instance so external callers that
+        # want an extra classifier gate can still inject one.
         self.should_retry = None
 
     @abstractmethod

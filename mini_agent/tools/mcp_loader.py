@@ -267,14 +267,30 @@ class MCPServerConnection:
         return read_stream, write_stream
 
     async def disconnect(self):
-        """Properly disconnect from the MCP server."""
+        """Properly disconnect from the MCP server.
+
+        Teardown is a best-effort path: `aclose()` can legitimately raise
+        during shutdown and the caller (usually a test `finally:` or the
+        CLI cleanup hook) should not see that noise. We still re-raise
+        user-initiated signals because respecting Ctrl-C / SIGTERM is
+        strictly more important than a tidy shutdown.
+        """
         if self.exit_stack:
             try:
                 await self.exit_stack.aclose()
-            except Exception:
-                # anyio cancel scope may raise RuntimeError or ExceptionGroup
-                # when stdio_client's task group is closed from a different
-                # task context during shutdown.
+            except (KeyboardInterrupt, SystemExit):
+                # Never swallow user-initiated termination.
+                raise
+            except BaseException:
+                # Shutdown shapes we specifically want silenced here:
+                #   - anyio RuntimeError / ExceptionGroup when
+                #     `stdio_client`'s task group is closed from a
+                #     different task context
+                #   - bare `asyncio.CancelledError`, which is a
+                #     `BaseException` (not `Exception`) on Py3.8+ and
+                #     therefore escapes a plain `except Exception:`.
+                #     Newer anyio raises it this way when a cancel
+                #     scope unwinds on the wrong task during teardown.
                 pass
             finally:
                 self.exit_stack = None

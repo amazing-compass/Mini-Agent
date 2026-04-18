@@ -8,8 +8,7 @@ from typing import Any, Optional
 
 import tiktoken
 
-from .llm import LLMClient
-from .llm.ha import ContextOverflowError
+from .llm.ha import ContextOverflowError, ModelRouter
 from .logger import AgentLogger
 from .schema import ContextSummary, Message
 from .tools.base import Tool, ToolResult
@@ -48,14 +47,20 @@ class Agent:
 
     def __init__(
         self,
-        llm_client: LLMClient,
+        router: ModelRouter,
         system_prompt: str,
         tools: list[Tool],
         max_steps: int = 50,
         workspace_dir: str = "./workspace",
         token_limit: int = 80000,  # Summary triggered when tokens exceed this value
     ):
-        self.llm = llm_client
+        """Phase 3: Agent directly owns a `ModelRouter` — no more facade.
+
+        `router.call(messages, tools)` replaces the old `llm.generate`;
+        `router.internal_call(messages, tools)` replaces the L4 summary
+        path. Design §1.0 + §8.2 + §13.7 step 3.
+        """
+        self.router = router
         self.tools = {tool.name: tool for tool in tools}
         self.max_steps = max_steps
         self.token_limit = token_limit
@@ -502,17 +507,9 @@ Requirements:
         ]
         # L4 summary goes through the router's **internal_call** bypass so
         # a summary failure or cooldown-open node doesn't poison business
-        # node health or recurse back into compression. `internal_call` is
-        # exposed by the LLMClient facade, which delegates to the router.
-        caller = getattr(self.llm, "internal_call", None)
+        # node health or recurse back into compression (design §5.9).
         try:
-            if caller is not None:
-                response = await caller(messages=summary_messages)
-            else:
-                # Legacy path (tests/mocks without `internal_call`): fall
-                # back to `generate`. Accepts the slightly higher risk
-                # because those callers don't participate in the breaker.
-                response = await self.llm.generate(messages=summary_messages)
+            response = await self.router.internal_call(summary_messages)
             return response.content
         except Exception:
             # Fallback: return truncated raw content
@@ -526,12 +523,12 @@ Requirements:
     async def safe_generate(self, tool_list: list) -> Any:
         """Public entry point: call the LLM with ContextOverflow recovery.
 
-        Both `Agent.run()` (CLI path) and any external driver that owns
-        this Agent (e.g. ACP sessions) should go through here instead of
-        calling `self.llm.generate(...)` directly — otherwise the
-        Phase 2 router's pre-flight `ContextOverflowError` surfaces as a
-        hard crash instead of triggering the L1/L2/L4 compression +
-        retry flow defined by design §5.7.
+        `Agent.run()` (CLI path) and any external driver that owns this
+        Agent should go through here instead of calling
+        `self.router.call(...)` directly — otherwise the pre-flight
+        `ContextOverflowError` surfaces as a hard crash instead of
+        triggering the L1/L2/L4 compression + retry flow defined by
+        design §5.7.
 
         The method is a thin wrapper around
         `_generate_with_overflow_recovery` and exists so the naming
@@ -563,7 +560,7 @@ Requirements:
         compress (no older rounds), so calling it unconditionally is safe.
         """
         try:
-            return await self.llm.generate(
+            return await self.router.call(
                 messages=self.render_for_provider(), tools=tool_list
             )
         except ContextOverflowError as exc:
@@ -595,7 +592,7 @@ Requirements:
         # One retry with the compressed messages. If this *also* raises
         # ContextOverflowError, let it propagate — agent has done
         # everything it can, the caller sees a real failure.
-        return await self.llm.generate(
+        return await self.router.call(
             messages=self.render_for_provider(), tools=tool_list
         )
 

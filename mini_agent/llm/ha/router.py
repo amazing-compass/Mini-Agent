@@ -12,8 +12,8 @@ Phase 2 adds:
   (closed / half-open), no on_attempt, no record_*, no failover, no
   fits pre-check. Failures bubble up so the agent can degrade to "no
   summary" without poisoning health.
-- `execute(fn)` (Phase 1 API) is preserved for backward compatibility
-  with `LLMClient`.
+- `execute(fn)` (Phase 1 API) is preserved for callers that need to
+  drive custom per-node lambdas directly (tests, ad-hoc scripts).
 
 The router never compresses `messages`. ContextOverflowError is always
 raised back to the agent — whether it came from the pre-flight bucket
@@ -26,6 +26,8 @@ from __future__ import annotations
 import logging
 from collections.abc import Awaitable, Callable
 from typing import Any, TypeVar
+
+import copy
 
 from ..base import LLMClientBase
 from .budget import TokenBudget
@@ -71,6 +73,8 @@ class ModelRouter:
         pool: ModelPool,
         health_registry: HealthRegistry | SimpleBreaker,
         strategy: str = "priority",
+        *,
+        cross_family_fallback: bool = False,
     ) -> None:
         if strategy not in self.SUPPORTED_STRATEGIES:
             raise ValueError(
@@ -85,6 +89,8 @@ class ModelRouter:
         # Phase 1 still work.
         self.health_registry = health_registry
         self.strategy = strategy
+        # Phase 3: opt-in cross-family failover (design §6).
+        self.cross_family_fallback = cross_family_fallback
 
         self.on_request_start: OnRequestStart | None = None
         self.on_failover: OnFailover | None = None
@@ -157,15 +163,94 @@ class ModelRouter:
                 attempts=[],
             )
 
-        # ---- Step 3: main loop — priority ordering --------------------
+        # ---- Step 3: group by protocol family, then run the main loop ----
         ordered = sorted(
             healthy_and_fits,
             key=lambda n: (-n.priority, n.node_id),
         )
+        primary_family = ordered[0].protocol_family
+        same_family = [n for n in ordered if n.protocol_family == primary_family]
+
+        # Cross-family candidates are ONLY considered when the operator
+        # opted in via `routing.cross_family_fallback`. Design §6 + §13.7
+        # step 1 of Block B.
+        cross_family: list[ModelNode] = []
+        if self.cross_family_fallback:
+            cross_family = [n for n in ordered if n.protocol_family != primary_family]
+            # Per-family priority order is preserved from `ordered`.
+
         candidate_ids = [n.node_id for n in ordered]
         attempts: list[tuple[str, ErrorCategory, Exception]] = []
 
-        for level, node in enumerate(ordered):
+        # ---- Step 3a: try primary family with the original messages ----
+        level_base = 0
+        response = await self._try_candidates(
+            same_family,
+            messages,
+            tools,
+            level_base=level_base,
+            candidate_ids=candidate_ids,
+            attempts=attempts,
+        )
+        if response is not None:
+            return response
+
+        # ---- Step 3b: cross-family hop (optional) ----
+        if not cross_family:
+            raise AllNodesFailedError(attempts=attempts)
+
+        # Different protocol family → drop `thinking` (Anthropic-only
+        # semantic block) and any orphan tool_use/tool_result pairs,
+        # and enforce capability gates (supports_tools if the caller
+        # actually passed tools). Design §6.1 diff 2, 4, 5.
+        target_family = cross_family[0].protocol_family
+        adapted_messages = self._prepare_messages_for_family(messages, target_family)
+        capable_cross = [
+            n for n in cross_family
+            if self._is_capable_for(n, adapted_messages, tools)
+        ]
+        if not capable_cross:
+            logger.warning(
+                "cross_family_fallback enabled but no %s-family node satisfies "
+                "capability gate for this request",
+                target_family,
+            )
+            raise AllNodesFailedError(attempts=attempts)
+
+        response = await self._try_candidates(
+            capable_cross,
+            adapted_messages,
+            tools,
+            level_base=len(same_family),
+            candidate_ids=candidate_ids,
+            attempts=attempts,
+        )
+        if response is not None:
+            return response
+
+        raise AllNodesFailedError(attempts=attempts)
+
+    async def _try_candidates(
+        self,
+        candidates: list[ModelNode],
+        messages: list[Any],
+        tools: list[Any] | None,
+        *,
+        level_base: int,
+        candidate_ids: list[str],
+        attempts: list[tuple[str, ErrorCategory, Exception]],
+    ) -> Any:
+        """Drive the main loop over one ordered candidate list.
+
+        Returns the successful response, or `None` if every candidate
+        failed with a switchable error (so the caller can decide whether
+        to hop to the other family).
+
+        ContextOverflow / BadRequest propagate out unchanged — those are
+        never cross-family retryable.
+        """
+        for idx, node in enumerate(candidates):
+            level = level_base + idx
             if self.on_request_start is not None:
                 try:
                     self.on_request_start(node, level)
@@ -190,42 +275,36 @@ class ModelRouter:
                     max_tokens=actual_max_tokens,
                 )
             except ContextOverflowError:
-                # Event-time capacity: provider told us we were wrong
-                # about fits. Don't switch nodes, don't compress — that's
-                # the agent's job. Don't record_failure (the node is
-                # fine; our estimator wasn't).
+                # Event-time capacity belongs to the agent — don't try
+                # a different node, don't compress; the agent's L1/L2/L4
+                # path is the right recovery.
                 raise
             except BadRequestError:
-                # Program bug — do not mask by trying the next node. Do
-                # not record_failure (it's not a node problem).
+                # Program bug — do not mask by trying the next node.
                 raise
             except (TransientError, RateLimitError, AuthError, NodeUnavailableError) as exc:
                 category = classify_error(exc)
                 attempts.append((node.node_id, category, exc))
                 self.breaker.record_failure(node.node_id, category, exc)
-                self._notify_failover(ordered, level, exc, category)
+                self._notify_failover(candidates, idx, exc, category)
                 continue
             except LLMError as exc:
-                # Other LLMError subclasses we didn't anticipate: treat
-                # as switchable transient-ish (stay on the safe side).
+                # Other LLMError subclasses we didn't anticipate.
                 category = classify_error(exc)
                 attempts.append((node.node_id, category, exc))
                 self.breaker.record_failure(node.node_id, category, exc)
-                self._notify_failover(ordered, level, exc, category)
+                self._notify_failover(candidates, idx, exc, category)
                 continue
             except Exception as exc:
-                # SDK-native exception that escaped normalization — classify
-                # via the duck-typed fallback and decide whether to switch.
+                # SDK-native exception that escaped normalization.
                 category = classify_error(exc)
                 attempts.append((node.node_id, category, exc))
                 if not is_node_switchable(category):
-                    # A capacity error that skipped our normalizer still
-                    # belongs to the agent; re-raise.
                     if category == ErrorCategory.CAPACITY:
                         raise ContextOverflowError(str(exc)) from exc
                     raise
                 self.breaker.record_failure(node.node_id, category, exc)
-                self._notify_failover(ordered, level, exc, category)
+                self._notify_failover(candidates, idx, exc, category)
                 continue
 
             # Success.
@@ -242,8 +321,7 @@ class ModelRouter:
             )
             return response
 
-        # Every healthy-and-fits candidate failed with switchable errors.
-        raise AllNodesFailedError(attempts=attempts)
+        return None
 
     async def internal_call(
         self,
@@ -288,9 +366,9 @@ class ModelRouter:
     def select_candidates(self) -> list[ModelNode]:
         """Phase 1 API — healthy-by-priority first, unhealthy-by-priority last.
 
-        Kept because `LLMClient.generate` (the pre-Phase-2 facade) still
-        drives its own failover via this ordering. New code should use
-        `.call()` which does the three-bucket classification itself.
+        Kept so tests and external callers can drive custom per-node
+        lambdas via `.execute(fn)`. New code should use `.call()` which
+        does the three-bucket classification itself.
         """
         enabled = self.pool.enabled()
 
@@ -306,8 +384,8 @@ class ModelRouter:
     ) -> tuple[T, RoutingDecision]:
         """Phase 1 API — invoke `fn` on successive candidates until one succeeds.
 
-        Preserved for `LLMClient.generate` (which we keep in Phase 2 so
-        ACP doesn't break). The bucket-aware path is `.call()`.
+        Retained for ad-hoc callers/tests that want to drive a custom
+        per-node coroutine. The production path is `.call()`.
         """
         candidates = self.select_candidates()
         if not candidates:
@@ -408,3 +486,142 @@ class ModelRouter:
             self.on_failover(ordered[failed_level], remaining[0], exc, category)
         except Exception:
             logger.exception("on_failover callback raised; continuing")
+
+    # ------------------------------------------------------------------
+    # Phase 3: cross-protocol-family helpers (design §6)
+    # ------------------------------------------------------------------
+
+    def _prepare_messages_for_family(
+        self,
+        messages: list[Any],
+        target_family: str,
+    ) -> list[Any]:
+        """Return a **copy** of messages safe to send to `target_family`.
+
+        Two transformations, always applied on a cross-family hop:
+
+        1. **Strip `thinking`** (design §6.1 diff 2). Anthropic's
+           `thinking` content-block has no OpenAI analog; replaying it
+           to the other family either errors out or bleeds reasoning
+           into the visible content.
+
+        2. **Drop orphan tool_calls / tool_results** (design §6.1 diffs
+           4, 5). If an assistant message claims `tool_calls=[tc1, tc2]`
+           but only tc1's `tool` result follows, OpenAI and Anthropic
+           both reject the payload with a 400. We drop the assistant's
+           orphan tool_call entries (keeping matched ones), and drop any
+           `tool` messages whose `tool_call_id` has no upstream tool_use.
+
+        Messages are deep-copied so the caller's view (and future same-
+        family attempts on unchanged messages) is untouched.
+        """
+        prepared: list[Any] = []
+        # First pass: collect the set of tool_call ids that appear in
+        # any assistant message; we'll use it to filter orphan tool
+        # results.
+        known_tool_call_ids: set[str] = set()
+        for msg in messages:
+            tool_calls = getattr(msg, "tool_calls", None)
+            if tool_calls:
+                for tc in tool_calls:
+                    tc_id = getattr(tc, "id", None)
+                    if tc_id:
+                        known_tool_call_ids.add(tc_id)
+
+        # Second pass: collect the set of tool_call_ids that actually
+        # have a matching `tool` result following them.
+        answered_tool_call_ids: set[str] = set()
+        for msg in messages:
+            if getattr(msg, "role", None) == "tool":
+                tc_id = getattr(msg, "tool_call_id", None)
+                if tc_id:
+                    answered_tool_call_ids.add(tc_id)
+
+        # Third pass: build the prepared list.
+        for msg in messages:
+            role = getattr(msg, "role", None)
+            # Drop orphan tool results (no matching tool_use upstream).
+            if role == "tool":
+                tc_id = getattr(msg, "tool_call_id", None)
+                if tc_id and tc_id not in known_tool_call_ids:
+                    continue
+                prepared.append(copy.deepcopy(msg))
+                continue
+
+            new_msg = copy.deepcopy(msg)
+            # Strip `thinking` unconditionally (it's the Anthropic-only
+            # block; OpenAI-side `reasoning_details` will be regenerated
+            # on the next assistant turn from the new provider).
+            if hasattr(new_msg, "thinking"):
+                try:
+                    new_msg.thinking = None
+                except (AttributeError, TypeError):
+                    pass  # frozen/__slots__/immutable: deep-copied, harmless
+                except Exception as e:
+                    # Validation errors (Pydantic) land here: if stripping
+                    # actually failed we must NOT silently forward the
+                    # unstripped `thinking` block to the other family.
+                    logger.warning(
+                        "Failed to strip 'thinking' on %s: %s",
+                        type(new_msg).__name__, e,
+                    )
+
+            # Filter assistant.tool_calls: keep only those with a
+            # matching tool result downstream. Orphans get dropped.
+            tool_calls = getattr(new_msg, "tool_calls", None)
+            if tool_calls:
+                kept = [
+                    tc for tc in tool_calls
+                    if getattr(tc, "id", None) in answered_tool_call_ids
+                ]
+                try:
+                    new_msg.tool_calls = kept or None
+                except (AttributeError, TypeError):
+                    pass
+                except Exception as e:
+                    logger.warning(
+                        "Failed to filter tool_calls on %s: %s",
+                        type(new_msg).__name__, e,
+                    )
+                # If we dropped every tool_call AND the assistant has no
+                # content either, the message becomes useless — drop it.
+                content = getattr(new_msg, "content", None)
+                if not kept and not content:
+                    continue
+
+            prepared.append(new_msg)
+
+        return prepared
+
+    def _is_capable_for(
+        self,
+        node: ModelNode,
+        messages: list[Any],
+        tools: list[Any] | None,
+    ) -> bool:
+        """Capability gate applied per candidate for cross-family hops.
+
+        Three checks (design §6.2):
+        - `supports_tools` — if the caller passed tools, the target
+          must advertise tool support. Same guard if the adapted
+          messages still reference tool_calls after orphan cleanup.
+        - `context_window` is already enforced by the upstream fits
+          bucket, so not re-checked here.
+        - `supports_thinking` is not gated: we strip `thinking` before
+          the hop, so the target doesn't need to understand it.
+        """
+        if tools:
+            if not node.supports_tools:
+                return False
+
+        # If messages include tool_calls (kept after orphan cleanup),
+        # the target must support tools even if the caller passed
+        # `tools=None` for this turn (the prior assistant turn is still
+        # in the transcript).
+        for msg in messages:
+            if getattr(msg, "tool_calls", None):
+                if not node.supports_tools:
+                    return False
+                break
+
+        return True

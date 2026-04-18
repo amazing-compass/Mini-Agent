@@ -8,8 +8,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from mini_agent import LLMClient
 from mini_agent.agent import Agent
+from mini_agent.llm.ha import ModelRouter
 from mini_agent.schema import LLMResponse, Message
 from mini_agent.tools.bash_tool import BashTool
 from mini_agent.tools.file_tools import ReadTool, WriteTool
@@ -17,10 +17,13 @@ from mini_agent.tools.note_tool import RecallNoteTool, SessionNoteTool
 
 
 @pytest.fixture
-def mock_llm_client():
-    """Create mock LLM client"""
-    client = MagicMock(spec=LLMClient)
-    return client
+def mock_router():
+    """Create a mock ModelRouter standing in for the real router.
+
+    Phase 3 removed the `LLMClient` facade — Agent now wires to a router
+    that exposes `.call(messages, tools)` and `.internal_call(...)`.
+    """
+    return MagicMock(spec=ModelRouter)
 
 
 @pytest.fixture
@@ -30,7 +33,7 @@ def temp_workspace():
         yield tmpdir
 
 
-def test_multi_turn_conversation(mock_llm_client, temp_workspace):
+def test_multi_turn_conversation(mock_router, temp_workspace):
     """Test multi-turn conversation and context sharing"""
     # Prepare test data
     system_prompt = "You are an intelligent assistant"
@@ -42,7 +45,7 @@ def test_multi_turn_conversation(mock_llm_client, temp_workspace):
 
     # Create agent
     agent = Agent(
-        llm_client=mock_llm_client,
+        router=mock_router,
         system_prompt=system_prompt,
         tools=tools,
         workspace_dir=temp_workspace,
@@ -73,10 +76,10 @@ def test_multi_turn_conversation(mock_llm_client, temp_workspace):
     assert user_messages[1].content == "Help me create a file"
 
 
-def test_session_history_management(mock_llm_client, temp_workspace):
+def test_session_history_management(mock_router, temp_workspace):
     """Test session history management"""
     agent = Agent(
-        llm_client=mock_llm_client,
+        router=mock_router,
         system_prompt="System prompt",
         tools=[],
         workspace_dir=temp_workspace,
@@ -97,10 +100,10 @@ def test_session_history_management(mock_llm_client, temp_workspace):
     assert agent.messages[0].role == "system"
 
 
-def test_get_history(mock_llm_client, temp_workspace):
+def test_get_history(mock_router, temp_workspace):
     """Test getting session history"""
     agent = Agent(
-        llm_client=mock_llm_client,
+        router=mock_router,
         system_prompt="System",
         tools=[],
         workspace_dir=temp_workspace,
@@ -141,10 +144,10 @@ async def test_session_note_persistence(temp_workspace):
     assert "Test note" in result2.content
 
 
-def test_message_statistics(mock_llm_client, temp_workspace):
+def test_message_statistics(mock_router, temp_workspace):
     """Test message statistics functionality"""
     agent = Agent(
-        llm_client=mock_llm_client,
+        router=mock_router,
         system_prompt="System",
         tools=[],
         workspace_dir=temp_workspace,

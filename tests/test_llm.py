@@ -1,52 +1,88 @@
-"""Test cases for LLM wrapper client."""
+"""Live-API smoke tests for provider clients through the pool/router.
+
+Phase 3 removed the `LLMClient` facade; these tests now construct a
+one-node `ModelPool + ModelRouter` and call `router.call(...)` directly.
+They still hit real APIs so offline runs skip them (no API key).
+"""
 
 import asyncio
+import os
 from pathlib import Path
 
 import pytest
 import yaml
 
-from mini_agent.llm import LLMClient
+from mini_agent.llm.ha import (
+    ModelNode,
+    ModelPool,
+    ModelRouter,
+    SimpleBreaker,
+    build_client_factory,
+)
 from mini_agent.schema import LLMProvider, Message
+
+
+def _load_yaml_config() -> dict:
+    config_path = Path("mini_agent/config/config.yaml")
+    with open(config_path, encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def _router_for(provider: LLMProvider) -> ModelRouter:
+    """Build a single-node pool + router for the given provider.
+
+    Reads credentials from the pool schema: picks the first entry whose
+    `provider` matches, else falls back to the first entry (for tests
+    that want to exercise a protocol family against whichever node is
+    available).
+    """
+    cfg = _load_yaml_config()
+    pool_cfg = cfg.get("llm", {}).get("pool") or cfg.get("pool") or []
+    if not pool_cfg:
+        pytest.skip("No pool entries in config.yaml; cannot run live test")
+
+    entry = next(
+        (n for n in pool_cfg if n.get("provider") == provider.value),
+        pool_cfg[0],
+    )
+    api_key = entry.get("api_key", "")
+    if not api_key:
+        env_var = entry.get("api_key_env", "")
+        if env_var:
+            api_key = os.environ.get(env_var, "")
+    if not api_key:
+        pytest.skip(f"No api_key for provider {provider.value}; skipping live test")
+
+    node = ModelNode(
+        node_id="live",
+        provider=provider.value,
+        protocol_family=provider.value,
+        api_key=api_key,
+        api_base=entry.get("api_base", "https://api.minimax.io"),
+        model=entry.get("model", "MiniMax-M2.5"),
+        priority=100,
+    )
+    pool = ModelPool([node], build_client=build_client_factory())
+    breaker = SimpleBreaker()
+    return ModelRouter(pool, breaker)
 
 
 @pytest.mark.asyncio
 async def test_wrapper_anthropic_provider():
-    """Test LLM wrapper with Anthropic provider."""
-    print("\n=== Testing LLM Wrapper (Anthropic Provider) ===")
+    """Test Anthropic provider end-to-end."""
+    print("\n=== Testing Router (Anthropic Provider) ===")
+    router = _router_for(LLMProvider.ANTHROPIC)
 
-    # Load config
-    config_path = Path("mini_agent/config/config.yaml")
-    with open(config_path, encoding="utf-8") as f:
-        config = yaml.safe_load(f)
-
-    # Create client with Anthropic provider
-    client = LLMClient(
-        api_key=config["api_key"],
-        provider=LLMProvider.ANTHROPIC,
-        api_base=config.get("api_base"),
-        model=config.get("model"),
-    )
-
-    assert client.provider == LLMProvider.ANTHROPIC
-
-    # Simple messages
     messages = [
         Message(role="system", content="You are a helpful assistant."),
         Message(role="user", content="Say 'Hello, Mini Agent!' and nothing else."),
     ]
 
     try:
-        response = await client.generate(messages=messages)
-
+        response = await router.call(messages=messages)
         print(f"Response: {response.content}")
-        print(f"Finish reason: {response.finish_reason}")
-
         assert response.content, "Response content is empty"
-        assert "Hello" in response.content or "hello" in response.content, (
-            f"Response doesn't contain 'Hello': {response.content}"
-        )
-
+        assert "Hello" in response.content or "hello" in response.content
         print("✅ Anthropic provider test passed")
         return True
     except Exception as e:
@@ -59,40 +95,20 @@ async def test_wrapper_anthropic_provider():
 
 @pytest.mark.asyncio
 async def test_wrapper_openai_provider():
-    """Test LLM wrapper with OpenAI provider."""
-    print("\n=== Testing LLM Wrapper (OpenAI Provider) ===")
+    """Test OpenAI provider end-to-end."""
+    print("\n=== Testing Router (OpenAI Provider) ===")
+    router = _router_for(LLMProvider.OPENAI)
 
-    # Load config
-    config_path = Path("mini_agent/config/config.yaml")
-    with open(config_path, encoding="utf-8") as f:
-        config = yaml.safe_load(f)
-
-    # Create client with OpenAI provider
-    client = LLMClient(
-        api_key=config["api_key"],
-        provider=LLMProvider.OPENAI,
-        model=config.get("model"),
-    )
-
-    assert client.provider == LLMProvider.OPENAI
-
-    # Simple messages
     messages = [
         Message(role="system", content="You are a helpful assistant."),
         Message(role="user", content="Say 'Hello, Mini Agent!' and nothing else."),
     ]
 
     try:
-        response = await client.generate(messages=messages)
-
+        response = await router.call(messages=messages)
         print(f"Response: {response.content}")
-        print(f"Finish reason: {response.finish_reason}")
-
         assert response.content, "Response content is empty"
-        assert "Hello" in response.content or "hello" in response.content, (
-            f"Response doesn't contain 'Hello': {response.content}"
-        )
-
+        assert "Hello" in response.content or "hello" in response.content
         print("✅ OpenAI provider test passed")
         return True
     except Exception as e:
@@ -104,52 +120,16 @@ async def test_wrapper_openai_provider():
 
 
 @pytest.mark.asyncio
-async def test_wrapper_default_provider():
-    """Test LLM wrapper with default provider (Anthropic)."""
-    print("\n=== Testing LLM Wrapper (Default Provider) ===")
-
-    # Load config
-    config_path = Path("mini_agent/config/config.yaml")
-    with open(config_path, encoding="utf-8") as f:
-        config = yaml.safe_load(f)
-
-    # Create client without specifying provider (should default to Anthropic)
-    client = LLMClient(
-        api_key=config["api_key"],
-        model=config.get("model"),
-    )
-
-    assert client.provider == LLMProvider.ANTHROPIC
-    print("✅ Default provider is Anthropic")
-    return True
-
-
-@pytest.mark.asyncio
 async def test_wrapper_tool_calling():
-    """Test LLM wrapper with tool calling."""
-    print("\n=== Testing LLM Wrapper Tool Calling ===")
+    """Test tool calling end-to-end through the router."""
+    print("\n=== Testing Router Tool Calling ===")
+    router = _router_for(LLMProvider.ANTHROPIC)
 
-    # Load config
-    config_path = Path("mini_agent/config/config.yaml")
-    with open(config_path, encoding="utf-8") as f:
-        config = yaml.safe_load(f)
-
-    # Create client with Anthropic provider
-    client = LLMClient(
-        api_key=config["api_key"],
-        provider=LLMProvider.ANTHROPIC,
-        model=config.get("model"),
-    )
-
-    # Messages requesting tool use
     messages = [
-        Message(
-            role="system", content="You are a helpful assistant with access to tools."
-        ),
+        Message(role="system", content="You are a helpful assistant with access to tools."),
         Message(role="user", content="Calculate 123 + 456 using the calculator tool."),
     ]
 
-    # Define a simple calculator tool using dict format
     tools = [
         {
             "name": "calculator",
@@ -157,19 +137,9 @@ async def test_wrapper_tool_calling():
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "operation": {
-                        "type": "string",
-                        "enum": ["add", "subtract", "multiply", "divide"],
-                        "description": "The operation to perform",
-                    },
-                    "a": {
-                        "type": "number",
-                        "description": "First number",
-                    },
-                    "b": {
-                        "type": "number",
-                        "description": "Second number",
-                    },
+                    "operation": {"type": "string", "enum": ["add", "subtract", "multiply", "divide"]},
+                    "a": {"type": "number"},
+                    "b": {"type": "number"},
                 },
                 "required": ["operation", "a", "b"],
             },
@@ -177,17 +147,12 @@ async def test_wrapper_tool_calling():
     ]
 
     try:
-        response = await client.generate(messages=messages, tools=tools)
-
-        print(f"Response: {response.content}")
+        response = await router.call(messages=messages, tools=tools)
         print(f"Tool calls: {response.tool_calls}")
-        print(f"Finish reason: {response.finish_reason}")
-
         if response.tool_calls:
             print("✅ Tool calling test passed - LLM requested tool use")
         else:
             print("⚠️  Warning: LLM didn't use tools, but request succeeded")
-
         return True
     except Exception as e:
         print(f"❌ Tool calling test failed: {e}")
@@ -198,31 +163,22 @@ async def test_wrapper_tool_calling():
 
 
 async def main():
-    """Run all LLM wrapper tests."""
+    """Run all tests."""
     print("=" * 80)
-    print("Running LLM Wrapper Tests")
+    print("Running Router live-API Tests")
     print("=" * 80)
     print("\nNote: These tests require a valid MiniMax API key in config.yaml")
 
     results = []
-
-    # Test default provider
-    results.append(await test_wrapper_default_provider())
-
-    # Test Anthropic provider
     results.append(await test_wrapper_anthropic_provider())
-
-    # Test OpenAI provider
     results.append(await test_wrapper_openai_provider())
-
-    # Test tool calling
     results.append(await test_wrapper_tool_calling())
 
     print("\n" + "=" * 80)
     if all(results):
-        print("All LLM wrapper tests passed! ✅")
+        print("All Router live-API tests passed! ✅")
     else:
-        print("Some LLM wrapper tests failed. Check the output above.")
+        print("Some tests failed. Check the output above.")
     print("=" * 80)
 
 

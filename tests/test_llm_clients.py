@@ -16,10 +16,24 @@ from mini_agent.schema import Message
 
 
 def load_config():
-    """Load config from config.yaml."""
+    """Load config from config.yaml.
+
+    Phase 3 is pool-only — surface the primary pool entry as a flat
+    dict so these live-API smoke tests keep reading like before.
+    """
     config_path = Path("mini_agent/config/config.yaml")
     with open(config_path, encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        raw = yaml.safe_load(f)
+    pool = raw.get("pool") or (raw.get("llm") or {}).get("pool") or []
+    if not pool:
+        pytest.skip("No pool entries in config.yaml — cannot run live client tests")
+    primary = pool[0]
+    return {
+        "api_key": primary.get("api_key"),
+        "model": primary.get("model"),
+        "provider": primary.get("provider", "anthropic"),
+        "api_base": primary.get("api_base", "https://api.minimaxi.com"),
+    }
 
 
 @pytest.mark.asyncio

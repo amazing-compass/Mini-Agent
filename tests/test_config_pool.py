@@ -19,7 +19,8 @@ def _write_yaml(tmp_path: Path, data: dict) -> Path:
     return p
 
 
-def test_legacy_single_node_config_still_loads(tmp_path: Path) -> None:
+def test_legacy_flat_config_is_rejected(tmp_path: Path) -> None:
+    """Phase 3 removes the legacy flat shape — top-level LLM fields must be rejected."""
     p = _write_yaml(
         tmp_path,
         {
@@ -29,11 +30,15 @@ def test_legacy_single_node_config_still_loads(tmp_path: Path) -> None:
             "model": "MiniMax-M2.5",
         },
     )
-    cfg = Config.from_yaml(p)
-    assert len(cfg.llm.pool) == 1
-    assert cfg.llm.pool[0].node_id == "default"
-    assert cfg.llm.pool[0].api_key == "sk-legacy"
-    assert cfg.llm.pool[0].model == "MiniMax-M2.5"
+    with pytest.raises(ValueError, match="Top-level LLM fields"):
+        Config.from_yaml(p)
+
+
+def test_missing_pool_is_rejected(tmp_path: Path) -> None:
+    """Phase 3 requires an explicit `pool:` block."""
+    p = _write_yaml(tmp_path, {"routing": {"strategy": "priority"}})
+    with pytest.raises(ValueError, match="pool"):
+        Config.from_yaml(p)
 
 
 def test_three_explicit_nodes_in_pool(tmp_path: Path) -> None:
@@ -42,10 +47,6 @@ def test_three_explicit_nodes_in_pool(tmp_path: Path) -> None:
     p = _write_yaml(
         tmp_path,
         {
-            "api_key": shared_key,  # legacy/primary surface
-            "api_base": "https://api.minimaxi.com",
-            "provider": "anthropic",
-            "model": "MiniMax-M2.7",
             "pool": [
                 {
                     "node_id": "m27",
@@ -83,11 +84,10 @@ def test_three_explicit_nodes_in_pool(tmp_path: Path) -> None:
 
 
 def test_pool_entry_without_api_key_raises(tmp_path: Path) -> None:
-    """We deliberately don't inherit api_key from the top level: each node must be explicit."""
+    """Each pool entry must declare its own `api_key` — the pool does NOT inherit."""
     p = _write_yaml(
         tmp_path,
         {
-            "api_key": "sk-top-level",  # present but should NOT propagate into pool entries
             "pool": [
                 {
                     "node_id": "orphan",
@@ -106,7 +106,6 @@ def test_cross_provider_pool(tmp_path: Path) -> None:
     p = _write_yaml(
         tmp_path,
         {
-            "api_key": "sk-fallback",
             "pool": [
                 {
                     "node_id": "primary",
@@ -158,7 +157,15 @@ def test_placeholder_api_key_rejected(tmp_path: Path) -> None:
     p = _write_yaml(
         tmp_path,
         {
-            "api_key": "YOUR_API_KEY_HERE",
+            "pool": [
+                {
+                    "node_id": "a",
+                    "provider": "anthropic",
+                    "api_key": "YOUR_API_KEY_HERE",
+                    "api_base": "https://api.minimax.io",
+                    "model": "MiniMax-M2.7",
+                }
+            ],
         },
     )
     with pytest.raises(ValueError, match="valid API Key"):
@@ -243,3 +250,93 @@ def test_real_config_yaml_loads_with_three_nodes() -> None:
         assert node.api_key, f"node {node.node_id} missing api_key"
         assert node.api_base, f"node {node.node_id} missing api_base"
         assert node.provider == "anthropic"
+
+
+# ----------------------------------------------------------------------
+# Agent section — nested `agent:` block is the blessed form.
+# Top-level keys are kept as a back-compat shim (mirrors retry/routing/
+# breaker which also accept either nested or top-level), but nested
+# MUST win when both are present.
+# ----------------------------------------------------------------------
+
+_MINIMAL_POOL: list[dict] = [
+    {
+        "node_id": "a",
+        "provider": "anthropic",
+        "api_key": "sk-x",
+        "api_base": "https://api.minimax.io",
+        "model": "MiniMax-M2.7",
+    }
+]
+
+
+def test_nested_agent_block_is_honored(tmp_path: Path) -> None:
+    """A YAML with `agent: {max_steps: 7, ...}` must NOT be silently dropped."""
+    p = _write_yaml(
+        tmp_path,
+        {
+            "pool": _MINIMAL_POOL,
+            "agent": {
+                "max_steps": 7,
+                "workspace_dir": "/tmp/nested-ws",
+                "system_prompt_path": "nested_prompt.md",
+            },
+        },
+    )
+    cfg = Config.from_yaml(p)
+    assert cfg.agent.max_steps == 7
+    assert cfg.agent.workspace_dir == "/tmp/nested-ws"
+    assert cfg.agent.system_prompt_path == "nested_prompt.md"
+
+
+def test_top_level_agent_fields_still_work_as_legacy_shim(tmp_path: Path) -> None:
+    """Legacy top-level shape must keep loading (back-compat)."""
+    p = _write_yaml(
+        tmp_path,
+        {
+            "pool": _MINIMAL_POOL,
+            "max_steps": 11,
+            "workspace_dir": "/tmp/legacy-ws",
+            "system_prompt_path": "legacy_prompt.md",
+        },
+    )
+    cfg = Config.from_yaml(p)
+    assert cfg.agent.max_steps == 11
+    assert cfg.agent.workspace_dir == "/tmp/legacy-ws"
+    assert cfg.agent.system_prompt_path == "legacy_prompt.md"
+
+
+def test_nested_agent_wins_over_top_level(tmp_path: Path) -> None:
+    """When both forms appear, the nested `agent:` block takes precedence."""
+    p = _write_yaml(
+        tmp_path,
+        {
+            "pool": _MINIMAL_POOL,
+            "max_steps": 11,            # legacy
+            "workspace_dir": "/legacy",  # legacy
+            "agent": {
+                "max_steps": 7,          # should win
+                "workspace_dir": "/nested",  # should win
+            },
+        },
+    )
+    cfg = Config.from_yaml(p)
+    assert cfg.agent.max_steps == 7
+    assert cfg.agent.workspace_dir == "/nested"
+
+
+def test_agent_block_partial_fills_from_defaults(tmp_path: Path) -> None:
+    """Partial `agent:` blocks fall back to AgentConfig defaults for missing fields."""
+    p = _write_yaml(
+        tmp_path,
+        {
+            "pool": _MINIMAL_POOL,
+            "agent": {"max_steps": 42},
+        },
+    )
+    cfg = Config.from_yaml(p)
+    assert cfg.agent.max_steps == 42
+    # `workspace_dir` default is `None` — CLI uses this to decide
+    # whether to fall back to cwd when `--workspace` is not given.
+    assert cfg.agent.workspace_dir is None
+    assert cfg.agent.system_prompt_path == "system_prompt.md"  # default

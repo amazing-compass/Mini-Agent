@@ -1,24 +1,18 @@
-"""Demo: Using Tool schemas with base Tool class.
+"""Demo: Using Tool schemas with the base Tool class.
 
-This example demonstrates how to use the Tool base class and its schema methods.
+Phase 3: the removed `LLMClient` facade is replaced by the provider
+clients (Anthropic or OpenAI) that the router assembles under the hood.
+This demo reaches for the Anthropic client directly because the focus
+is tool-schema conversion, not routing.
 """
 
 import asyncio
-from pathlib import Path
 from typing import Any
 
-import yaml
+from _common import build_direct_client, load_config
 
-from mini_agent import LLMClient, LLMProvider
-from mini_agent.schema import Message
+from mini_agent.schema import LLMProvider, Message
 from mini_agent.tools.base import Tool, ToolResult
-
-
-def load_config():
-    """Load config from config.yaml."""
-    config_path = Path("mini_agent/config/config.yaml")
-    with open(config_path, encoding="utf-8") as f:
-        return yaml.safe_load(f)
 
 
 class WeatherTool(Tool):
@@ -51,7 +45,6 @@ class WeatherTool(Tool):
         }
 
     async def execute(self, **kwargs) -> ToolResult:
-        """Mock execute method."""
         return ToolResult(success=True, content="Weather data")
 
 
@@ -71,10 +64,7 @@ class SearchTool(Tool):
         return {
             "type": "object",
             "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Search query string",
-                },
+                "query": {"type": "string", "description": "Search query string"},
                 "max_results": {
                     "type": "integer",
                     "description": "Maximum number of results to return (1-10)",
@@ -84,7 +74,6 @@ class SearchTool(Tool):
         }
 
     async def execute(self, **kwargs) -> ToolResult:
-        """Mock execute method."""
         return ToolResult(success=True, content="Search results")
 
 
@@ -113,7 +102,6 @@ class CalculatorTool(Tool):
         }
 
     async def execute(self, **kwargs) -> ToolResult:
-        """Mock execute method."""
         return ToolResult(success=True, content="Calculation result")
 
 
@@ -133,10 +121,7 @@ class TranslateTool(Tool):
         return {
             "type": "object",
             "properties": {
-                "text": {
-                    "type": "string",
-                    "description": "Text to translate",
-                },
+                "text": {"type": "string", "description": "Text to translate"},
                 "target_language": {
                     "type": "string",
                     "description": "Target language code (e.g. 'en', 'es', 'fr')",
@@ -146,30 +131,24 @@ class TranslateTool(Tool):
         }
 
     async def execute(self, **kwargs) -> ToolResult:
-        """Mock execute method."""
         return ToolResult(success=True, content="Translation result")
 
 
 async def demo_tool_schemas():
-    """Demonstrate using Tool objects with LLM."""
+    """Demo: passing Tool objects to the Anthropic client."""
     config = load_config()
+    if config is None:
+        return
 
     print("=" * 60)
     print("Method 1: Using Tool Objects with LLM")
     print("=" * 60)
 
-    # Create tool instances
     weather_tool = WeatherTool()
     search_tool = SearchTool()
 
-    # Create client
-    client = LLMClient(
-        api_key=config["api_key"],
-        provider=LLMProvider.ANTHROPIC,
-        model="MiniMax-M2.5",
-    )
+    client = build_direct_client(config, LLMProvider.ANTHROPIC)
 
-    # Test with a query that should trigger weather tool
     messages = [
         Message(
             role="user",
@@ -182,11 +161,7 @@ async def demo_tool_schemas():
     print(f"  1. {weather_tool.name}: {weather_tool.description}")
     print(f"  2. {search_tool.name}: {search_tool.description}")
 
-    # Pass Tool objects directly to generate
-    response = await client.generate(
-        messages,
-        tools=[weather_tool, search_tool],  # Using Tool objects
-    )
+    response = await client.generate(messages, tools=[weather_tool, search_tool])
 
     print(f"\nResponse content: {response.content}")
 
@@ -201,22 +176,19 @@ async def demo_tool_schemas():
 
 
 async def demo_multiple_tools():
-    """Demonstrate using multiple Tool instances."""
+    """Demo: multiple Tool instances passed to a single request."""
     config = load_config()
+    if config is None:
+        return
 
     print("\n" + "=" * 60)
     print("Method 2: Using Multiple Tool Instances")
     print("=" * 60)
 
-    # Create tool instances
     calculator_tool = CalculatorTool()
     translate_tool = TranslateTool()
 
-    client = LLMClient(
-        api_key=config["api_key"],
-        provider=LLMProvider.ANTHROPIC,
-        model="MiniMax-M2.5",
-    )
+    client = build_direct_client(config, LLMProvider.ANTHROPIC)
 
     messages = [Message(role="user", content="Calculate 15 * 23 for me")]
 
@@ -240,7 +212,7 @@ async def demo_multiple_tools():
 
 
 async def demo_tool_schema_methods():
-    """Demonstrate Tool schema conversion methods."""
+    """Demo: schema-conversion methods (no LLM call)."""
     print("\n" + "=" * 60)
     print("Method 3: Tool Schema Conversion Methods")
     print("=" * 60)
@@ -263,13 +235,8 @@ async def main():
     print("\n🚀 Tool Schema Demo - Using Tool Base Class\n")
 
     try:
-        # Demo 1: Tool objects with LLM
         await demo_tool_schemas()
-
-        # Demo 2: Multiple tools
         await demo_multiple_tools()
-
-        # Demo 3: Schema methods
         await demo_tool_schema_methods()
 
         print("\n✅ All demos completed successfully!")
