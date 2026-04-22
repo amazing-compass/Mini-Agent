@@ -126,6 +126,8 @@ class AgentLogger:
         result_success: bool,
         result_content: str | None = None,
         result_error: str | None = None,
+        permission_behavior: str | None = None,
+        permission_reason: str | None = None,
     ):
         """Log tool execution result
 
@@ -135,11 +137,16 @@ class AgentLogger:
             result_success: Whether successful
             result_content: Result content (on success)
             result_error: Error message (on failure)
+            permission_behavior: Permission decision, if the permission
+                gate ran: "allow" / "deny" / "ask". ``None`` when no
+                permission manager was configured.
+            permission_reason: The decision's rationale from
+                :class:`PermissionDecision`.
         """
         self.log_index += 1
 
         # Build complete tool execution result data structure
-        tool_result_data = {
+        tool_result_data: dict[str, Any] = {
             "tool_name": tool_name,
             "arguments": arguments,
             "success": result_success,
@@ -149,6 +156,12 @@ class AgentLogger:
             tool_result_data["result"] = result_content
         else:
             tool_result_data["error"] = result_error
+
+        if permission_behavior is not None:
+            tool_result_data["permission"] = {
+                "behavior": permission_behavior,
+                "reason": permission_reason,
+            }
 
         # Format as JSON
         content = "Tool Execution:\n\n"

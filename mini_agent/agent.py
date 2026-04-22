@@ -4,15 +4,23 @@ import asyncio
 import json
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 import tiktoken
 
 from .llm.ha import ContextOverflowError, ModelRouter
 from .logger import AgentLogger
+from .permissions import PermissionDecision, PermissionManager
+from .planning import PlanningManager
 from .schema import ContextSummary, Message
 from .tools.base import Tool, ToolResult
 from .utils import calculate_display_width
+
+
+# Type alias: approval callback signature.
+# Returns True to allow, False to deny. Reason is the PermissionDecision reason
+# so the CLI can display context ("why is this being asked?").
+ApprovalCallback = Callable[[str, dict, str], Awaitable[bool]]
 
 
 # ANSI color codes
@@ -53,12 +61,24 @@ class Agent:
         max_steps: int = 50,
         workspace_dir: str = "./workspace",
         token_limit: int = 80000,  # Summary triggered when tokens exceed this value
+        permission_manager: Optional[PermissionManager] = None,
+        approval_callback: Optional[ApprovalCallback] = None,
+        planning_manager: Optional[PlanningManager] = None,
     ):
         """Phase 3: Agent directly owns a `ModelRouter` — no more facade.
 
         `router.call(messages, tools)` replaces the old `llm.generate`;
         `router.internal_call(messages, tools)` replaces the L4 summary
         path. Design §1.0 + §8.2 + §13.7 step 3.
+
+        Permission system (optional):
+          - ``permission_manager``: if ``None``, all tool calls are executed
+            directly (legacy behaviour). If provided, every tool call passes
+            through its ``check()`` first.
+          - ``approval_callback``: invoked when the decision is ``ask``. If
+            ``None`` (e.g. ``--task`` non-interactive mode), ``ask`` falls back
+            to ``deny`` — this prevents agents from hanging forever waiting
+            for a user who isn't there.
         """
         self.router = router
         self.tools = {tool.name: tool for tool in tools}
@@ -67,6 +87,16 @@ class Agent:
         self.workspace_dir = Path(workspace_dir)
         # Cancellation event for interrupting agent execution (set externally, e.g., by Esc key)
         self.cancel_event: Optional[asyncio.Event] = None
+
+        # Permission system (both optional — agent is fully backwards-compatible).
+        self.permission_manager: Optional[PermissionManager] = permission_manager
+        self.approval_callback: Optional[ApprovalCallback] = approval_callback
+
+        # Session planner (optional). When present, `render_for_provider()`
+        # surfaces the current plan + stale-plan reminder into the system
+        # prompt, and the tool loop ticks its stale counter after every
+        # step that didn't call `todo_write`.
+        self.planning_manager: Optional[PlanningManager] = planning_manager
 
         # Ensure workspace exists
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
@@ -121,9 +151,17 @@ class Agent:
         if self.cold_summaries:
             merged = "\n\n---\n\n".join(s.raw_text for s in self.cold_summaries)
             system_content += f"\n\n## Historical Summary\n{merged}"
+
+        # 2. Current session plan (after summaries, before live messages).
+        #    Empty string when there's no plan → append nothing.
+        if self.planning_manager is not None:
+            plan_section = self.planning_manager.render_for_prompt()
+            if plan_section:
+                system_content += f"\n\n{plan_section}"
+
         result.append(Message(role="system", content=system_content))
 
-        # 2. Recent raw messages
+        # 3. Recent raw messages
         result.extend(self.live_messages)
 
         return result
@@ -731,8 +769,19 @@ Requirements:
                 print(f"\n{Colors.BOLD}{Colors.BRIGHT_BLUE}🤖 Assistant:{Colors.RESET}")
                 print(f"{response.content}")
 
+            # Track whether this step refreshed the session plan. Declared
+            # up-front so the no-tool-calls early return can also tick.
+            # (Without this, a direct-answer turn never advances the stale
+            # counter — causing the reminder to never fire across pure
+            # conversational turns.)
+            step_touched_plan = False
+
             # Check if task is complete (no tool calls)
             if not response.tool_calls:
+                # A direct-answer turn still counts as a "step" during
+                # which the plan was NOT refreshed, so tick here.
+                if self.planning_manager is not None:
+                    self.planning_manager.note_round_without_update()
                 step_elapsed = perf_counter() - step_start_time
                 total_elapsed = perf_counter() - run_start_time
                 print(f"\n{Colors.DIM}⏱️  Step {step + 1} completed in {step_elapsed:.2f}s (total: {total_elapsed:.2f}s){Colors.RESET}")
@@ -768,14 +817,74 @@ Requirements:
                 for line in args_json.split("\n"):
                     print(f"   {Colors.DIM}{line}{Colors.RESET}")
 
-                # Execute tool
+                # Unknown tool: short-circuit before permission gate.
+                # A hallucinated tool name has nothing to approve.
+                result: Optional[ToolResult] = None
+                permission_decision: Optional[PermissionDecision] = None
                 if function_name not in self.tools:
                     result = ToolResult(
                         success=False,
                         content="",
                         error=f"Unknown tool: {function_name}",
                     )
-                else:
+
+                # Permission gate (only for known tools).
+                if result is None and self.permission_manager is not None:
+                    permission_decision = self.permission_manager.check(
+                        function_name, arguments
+                    )
+
+                    if permission_decision.behavior == "deny":
+                        print(
+                            f"{Colors.BRIGHT_RED}⛔ Denied:{Colors.RESET} "
+                            f"{Colors.RED}{permission_decision.reason}{Colors.RESET}"
+                        )
+                        result = ToolResult(
+                            success=False,
+                            content="",
+                            error=f"Permission denied: {permission_decision.reason}",
+                        )
+                    elif permission_decision.behavior == "ask":
+                        approved = False
+                        if self.approval_callback is not None:
+                            try:
+                                approved = await self.approval_callback(
+                                    function_name,
+                                    arguments,
+                                    permission_decision.reason,
+                                )
+                            except Exception as approval_exc:
+                                # A broken approval callback must not execute
+                                # the tool. Log and deny.
+                                approved = False
+                                print(
+                                    f"{Colors.BRIGHT_RED}⛔ Approval callback failed:{Colors.RESET} "
+                                    f"{Colors.RED}{approval_exc}{Colors.RESET}"
+                                )
+                        else:
+                            # Non-interactive mode (e.g. --task): no one to ask.
+                            print(
+                                f"{Colors.BRIGHT_RED}⛔ Denied (non-interactive):{Colors.RESET} "
+                                f"{Colors.RED}{permission_decision.reason}{Colors.RESET}"
+                            )
+                        if not approved:
+                            reason_tag = (
+                                "user rejected"
+                                if self.approval_callback is not None
+                                else "no approval callback (ask→deny)"
+                            )
+                            result = ToolResult(
+                                success=False,
+                                content="",
+                                error=(
+                                    f"Permission denied: {reason_tag}. "
+                                    f"Original decision: {permission_decision.reason}"
+                                ),
+                            )
+                    # On "allow", result stays None and the tool executes below.
+
+                # Execute tool if gate did not block.
+                if result is None:
                     try:
                         tool = self.tools[function_name]
                         result = await tool.execute(**arguments)
@@ -791,13 +900,27 @@ Requirements:
                             error=f"Tool execution failed: {error_detail}\n\nTraceback:\n{error_trace}",
                         )
 
-                # Log tool execution result
+                # Log tool execution result, including the permission
+                # decision when the gate ran. `permission_decision` is
+                # ``None`` when no manager is attached OR when the tool
+                # was rejected earlier as Unknown (in which case there is
+                # nothing meaningful to approve).
                 self.logger.log_tool_result(
                     tool_name=function_name,
                     arguments=arguments,
                     result_success=result.success,
                     result_content=result.content if result.success else None,
                     result_error=result.error if not result.success else None,
+                    permission_behavior=(
+                        permission_decision.behavior
+                        if permission_decision is not None
+                        else None
+                    ),
+                    permission_reason=(
+                        permission_decision.reason
+                        if permission_decision is not None
+                        else None
+                    ),
                 )
 
                 # Print result
@@ -819,12 +942,24 @@ Requirements:
                         content=arguments.get("content", ""),
                     )
 
+                # Intercept todo_write: the stale-plan counter has already
+                # been reset by PlanningManager.update() on success; here
+                # we just remember that a refresh happened this step.
+                if function_name == "todo_write" and result.success:
+                    step_touched_plan = True
+
                 # Check for cancellation after each tool execution
                 if self._check_cancelled():
                     self._cleanup_incomplete_messages()
                     cancel_msg = "Task cancelled by user."
                     print(f"\n{Colors.BRIGHT_YELLOW}⚠️  {cancel_msg}{Colors.RESET}")
                     return cancel_msg
+
+            # Tick the stale-plan counter if the step didn't refresh the
+            # plan. Only meaningful when there IS a plan — the manager
+            # itself guards against ticking on an empty plan.
+            if self.planning_manager is not None and not step_touched_plan:
+                self.planning_manager.note_round_without_update()
 
             step_elapsed = perf_counter() - step_start_time
             total_elapsed = perf_counter() - run_start_time

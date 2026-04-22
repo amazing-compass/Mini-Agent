@@ -36,6 +36,12 @@ from mini_agent.llm.ha import (
     SimpleBreaker,
     build_client_factory,
 )
+from mini_agent.permissions import (
+    PermissionManager,
+    PermissionMode,
+    VALID_MODES,
+)
+from mini_agent.planning import PlanningManager, TodoWriteTool
 from mini_agent.tools.base import Tool
 from mini_agent.tools.bash_tool import BashKillTool, BashOutputTool, BashTool
 from mini_agent.tools.file_tools import EditTool, ReadTool, WriteTool
@@ -203,6 +209,10 @@ def print_help():
   {Colors.BRIGHT_GREEN}/stats{Colors.RESET}     - Show session statistics
   {Colors.BRIGHT_GREEN}/log{Colors.RESET}       - Show log directory and recent files
   {Colors.BRIGHT_GREEN}/log <file>{Colors.RESET} - Read a specific log file
+  {Colors.BRIGHT_GREEN}/mode{Colors.RESET}      - Show current permission mode
+  {Colors.BRIGHT_GREEN}/mode <m>{Colors.RESET}  - Switch mode: default / plan / auto
+  {Colors.BRIGHT_GREEN}/rules{Colors.RESET}     - List active permission rules
+  {Colors.BRIGHT_GREEN}/plan{Colors.RESET}      - Show the current session plan
   {Colors.BRIGHT_GREEN}/exit{Colors.RESET}      - Exit program (also: exit, quit, q)
 
 {Colors.BOLD}{Colors.BRIGHT_YELLOW}Keyboard Shortcuts:{Colors.RESET}
@@ -317,6 +327,29 @@ Examples:
         type=str,
         default=None,
         help="Execute a task non-interactively and exit",
+    )
+    parser.add_argument(
+        "--mode",
+        "-m",
+        type=str,
+        choices=list(VALID_MODES),
+        default="default",
+        help=(
+            "Permission mode: 'default' asks for write tools; "
+            "'plan' blocks writes (analysis-only); "
+            "'auto' auto-allows read/session-meta tools"
+        ),
+    )
+    parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help=(
+            "Auto-approve every 'ask' permission prompt. Use this to "
+            "unblock --task runs that need to modify files or run bash, "
+            "or to skip interactive confirmations. Note: 'plan' mode's "
+            "deny rules are still absolute and override --yes."
+        ),
     )
     parser.add_argument(
         "--version",
@@ -488,12 +521,42 @@ async def _quiet_cleanup():
         pass
 
 
-async def run_agent(workspace_dir: Path, task: str = None):
+async def _auto_yes_approval(
+    tool_name: str,
+    arguments: dict,
+    decision_reason: str,
+) -> bool:
+    """Approval callback that auto-approves every ``ask`` decision.
+
+    Installed when ``--yes`` is set. Deliberately prints a one-line
+    audit trail for each auto-approval so users / reviewers of the log
+    can see exactly what was let through without interactive confirmation.
+    """
+    del arguments  # The caller (Agent.run) has already printed these.
+    print(
+        f"{Colors.DIM}[auto-approved]{Colors.RESET} "
+        f"{Colors.BOLD}{Colors.CYAN}{tool_name}{Colors.RESET}"
+        f"{Colors.DIM} — {decision_reason}{Colors.RESET}"
+    )
+    return True
+
+
+async def run_agent(
+    workspace_dir: Path,
+    task: str = None,
+    mode: PermissionMode = "default",
+    yes: bool = False,
+):
     """Run Agent in interactive or non-interactive mode.
 
     Args:
         workspace_dir: Workspace directory path
         task: If provided, execute this task and exit (non-interactive mode)
+        mode: Initial permission mode ('default' / 'plan' / 'auto')
+        yes: Auto-approve every ``ask`` permission prompt. Lets ``--task``
+            runs execute mutating tools without stdin, and skips interactive
+            confirmation in REPL mode. ``plan`` mode's deny rules still
+            apply (deny always beats ask+yes).
     """
     session_start = datetime.now()
 
@@ -665,6 +728,33 @@ async def run_agent(workspace_dir: Path, task: str = None):
     # Agent stays blissfully unaware of the NodePool itself (design §7.3).
     pool_windows = pool.all_context_windows()
     token_limit = int(min(pool_windows) * 0.8) if pool_windows else 80000
+
+    # Build permission system + approval callback.
+    # - Manager: always constructed, starts in the requested mode.
+    # - Approval callback selection:
+    #     * --yes     → auto_yes_approval (works in BOTH --task and REPL)
+    #     * --task    → None (no stdin available; ask→deny is the agent's
+    #                   safe default)
+    #     * REPL      → None here, rebound to request_tool_approval once
+    #                   the PromptSession is ready below.
+    permission_manager = PermissionManager(mode=mode)
+    if yes:
+        approval_callback = _auto_yes_approval
+        print(
+            f"{Colors.BRIGHT_YELLOW}⚡ --yes enabled:{Colors.RESET} "
+            f"{Colors.DIM}all 'ask' prompts will auto-approve "
+            f"(deny rules still apply){Colors.RESET}"
+        )
+    else:
+        approval_callback = None  # Set below for REPL, stays None for --task.
+
+    # Session planner. Plan state lives here (not in messages) so it
+    # survives context compression and is always rendered into prompt
+    # via Agent.render_for_provider().
+    planning_manager = PlanningManager()
+    tools.append(TodoWriteTool(planning_manager))
+    print(f"{Colors.GREEN}✅ Loaded todo_write tool (session planner){Colors.RESET}")
+
     agent = Agent(
         router=router,
         system_prompt=system_prompt,
@@ -672,6 +762,9 @@ async def run_agent(workspace_dir: Path, task: str = None):
         max_steps=config.agent.max_steps,
         workspace_dir=str(workspace_dir),
         token_limit=token_limit,
+        permission_manager=permission_manager,
+        approval_callback=approval_callback,  # Rebound before interactive loop starts.
+        planning_manager=planning_manager,
     )
 
     # 7.5 Load pinned notes from previous sessions
@@ -692,6 +785,15 @@ async def run_agent(workspace_dir: Path, task: str = None):
 
     # 8.5 Non-interactive mode: execute task and exit
     if task:
+        if not yes:
+            # Friendly hint: without --yes, ask-class tools (write_file,
+            # edit_file, bash, MCP) will deny because there's no way to
+            # prompt. Many --task users will want --yes.
+            print(
+                f"{Colors.DIM}hint: add --yes / -y to auto-approve ask "
+                f"prompts (needed for write / edit / bash in --task mode)"
+                f"{Colors.RESET}"
+            )
         print(f"\n{Colors.BRIGHT_BLUE}Agent{Colors.RESET} {Colors.DIM}›{Colors.RESET} {Colors.DIM}Executing task...{Colors.RESET}\n")
         agent.add_user_message(task)
         try:
@@ -708,7 +810,19 @@ async def run_agent(workspace_dir: Path, task: str = None):
     # 9. Setup prompt_toolkit session
     # Command completer
     command_completer = WordCompleter(
-        ["/help", "/clear", "/history", "/stats", "/log", "/exit", "/quit", "/q"],
+        [
+            "/help",
+            "/clear",
+            "/history",
+            "/stats",
+            "/log",
+            "/mode",
+            "/rules",
+            "/plan",
+            "/exit",
+            "/quit",
+            "/q",
+        ],
         ignore_case=True,
         sentence=True,
     )
@@ -751,6 +865,54 @@ async def run_agent(workspace_dir: Path, task: str = None):
         key_bindings=kb,
     )
 
+    # Dedicated PromptSession for mid-run approval prompts. Using a
+    # separate session keeps the main input history clean and avoids
+    # interleaving y/N answers with user tasks.
+    approval_session = PromptSession(style=prompt_style)
+
+    async def request_tool_approval(
+        tool_name: str,
+        arguments: dict,
+        decision_reason: str,
+    ) -> bool:
+        """Interactive y/N approval prompt.
+
+        The tool name + arguments were already printed by Agent.run();
+        we only re-anchor the tool name in the prompt so the user knows
+        exactly which call this y/N refers to even if scrollback is busy.
+        """
+        del arguments  # Already displayed by the caller.
+        print(
+            f"{Colors.BRIGHT_YELLOW}⚠️  Permission ask for{Colors.RESET} "
+            f"{Colors.BOLD}{Colors.CYAN}{tool_name}{Colors.RESET}"
+            f"{Colors.DIM} — {decision_reason}{Colors.RESET}"
+        )
+        try:
+            answer = await approval_session.prompt_async(
+                [
+                    ("class:prompt", "Allow?"),
+                    ("", " [y/N] "),
+                ],
+                multiline=False,
+            )
+        except (KeyboardInterrupt, EOFError):
+            # Treat Ctrl+C / Ctrl+D during an approval prompt as a deny
+            # so the user stays in control of what actually runs.
+            return False
+        return answer.strip().lower() in ("y", "yes")
+
+    # Wire the interactive approval prompt into the Agent — but only
+    # when --yes isn't active. If --yes was set, the auto_yes callback
+    # is already installed and we must not overwrite it.
+    if not yes:
+        agent.approval_callback = request_tool_approval
+
+    print(
+        f"{Colors.DIM}🔐 Permission mode: "
+        f"{Colors.BRIGHT_CYAN}{permission_manager.mode}{Colors.RESET}"
+        f"{Colors.DIM} (use /mode to change){Colors.RESET}"
+    )
+
     # 10. Interactive loop
     while True:
         try:
@@ -785,7 +947,14 @@ async def run_agent(workspace_dir: Path, task: str = None):
                     # Clear message history but keep system prompt
                     old_count = len(agent.messages)
                     agent.messages = [agent.messages[0]]  # Keep only system message
-                    print(f"{Colors.GREEN}✅ Cleared {old_count - 1} messages, starting new session{Colors.RESET}\n")
+                    # Session plan is session-scoped — wipe it with the
+                    # rest of the conversation so /clear really starts
+                    # from a blank slate (pinned_notes survive by design).
+                    planning_manager.clear()
+                    print(
+                        f"{Colors.GREEN}✅ Cleared {old_count - 1} messages "
+                        f"and session plan, starting new session{Colors.RESET}\n"
+                    )
                     continue
 
                 elif command == "/history":
@@ -806,6 +975,71 @@ async def run_agent(workspace_dir: Path, task: str = None):
                         # /log <filename> - read specific log file
                         filename = parts[1].strip("\"'")
                         read_log_file(filename)
+                    continue
+
+                elif command == "/mode" or command.startswith("/mode "):
+                    parts = user_input.split(maxsplit=1)
+                    if len(parts) == 1:
+                        print(
+                            f"\n{Colors.BRIGHT_CYAN}Current permission mode: "
+                            f"{Colors.BOLD}{permission_manager.mode}{Colors.RESET}"
+                        )
+                        print(
+                            f"{Colors.DIM}Available modes: "
+                            f"{', '.join(VALID_MODES)}{Colors.RESET}\n"
+                        )
+                    else:
+                        new_mode = parts[1].strip().lower()
+                        try:
+                            permission_manager.set_mode(new_mode)  # type: ignore[arg-type]
+                            print(
+                                f"{Colors.GREEN}✅ Permission mode set to "
+                                f"{Colors.BOLD}{new_mode}{Colors.RESET}\n"
+                            )
+                        except ValueError as exc:
+                            print(f"{Colors.RED}❌ {exc}{Colors.RESET}\n")
+                    continue
+
+                elif command == "/plan":
+                    plan_section = planning_manager.render_for_prompt()
+                    if not plan_section:
+                        print(
+                            f"\n{Colors.DIM}No session plan yet. The agent "
+                            f"will create one with todo_write when needed."
+                            f"{Colors.RESET}\n"
+                        )
+                    else:
+                        print(f"\n{plan_section}\n")
+                    continue
+
+                elif command == "/rules":
+                    rules = permission_manager.rules
+                    print(
+                        f"\n{Colors.BRIGHT_CYAN}Active permission rules "
+                        f"({len(rules)}){Colors.RESET}"
+                    )
+                    if not rules:
+                        print(f"{Colors.DIM}  (no rules configured){Colors.RESET}\n")
+                    else:
+                        for rule in rules:
+                            extra = []
+                            if rule.path is not None:
+                                extra.append(f"path~{rule.path!r}")
+                            if rule.content is not None:
+                                extra.append(f"content~{rule.content!r}")
+                            extra_str = f" [{', '.join(extra)}]" if extra else ""
+                            colour = (
+                                Colors.BRIGHT_GREEN
+                                if rule.behavior == "allow"
+                                else Colors.BRIGHT_RED
+                                if rule.behavior == "deny"
+                                else Colors.BRIGHT_YELLOW
+                            )
+                            print(
+                                f"  {colour}{rule.behavior:5s}{Colors.RESET} "
+                                f"{rule.tool}{extra_str}"
+                            )
+                        print()
                     continue
 
                 else:
@@ -969,7 +1203,14 @@ def main():
     workspace_dir.mkdir(parents=True, exist_ok=True)
 
     # Run the agent (config always loaded from package directory)
-    asyncio.run(run_agent(workspace_dir, task=args.task))
+    asyncio.run(
+        run_agent(
+            workspace_dir,
+            task=args.task,
+            mode=args.mode,
+            yes=args.yes,
+        )
+    )
 
 
 if __name__ == "__main__":
