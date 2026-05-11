@@ -36,6 +36,7 @@ env/
 # Workspace
 workspace/
 *.log
+logs/
 
 # OS
 .DS_Store
@@ -55,7 +56,12 @@ demo_commands.txt
 mcp.json.bak
 
 docs/
+bash-agent/
 
 CLAUDE.md
 
 .agent_memory.json
+
+# Benchmark runs (predictions, trajectories, logs)
+benchmark_runs/
+mini-agent-*.json

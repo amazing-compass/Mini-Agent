@@ -143,36 +143,74 @@ class AnthropicClient(LLMClientBase):
     def _convert_messages(self, messages: list[Message]) -> tuple[str | None, list[dict[str, Any]]]:
         """Convert internal messages to Anthropic format.
 
+        Important: when an assistant message contains multiple ``tool_use``
+        blocks (parallel tool calls), the **immediately following user
+        message must contain all matching ``tool_result`` blocks together**.
+        Strict Anthropic-compatible endpoints (e.g. DeepSeek's
+        ``/anthropic`` endpoint) reject the request with
+        ``400 invalid_request_error: tool_use ids were found without
+        tool_result blocks immediately after`` when results are split
+        across multiple user messages.
+
+        We therefore batch consecutive ``role="tool"`` messages into a
+        single user message whose ``content`` is a list of all collected
+        ``tool_result`` blocks. The order is preserved so each ``tool_use``
+        is matched with its corresponding result.
+
+        MiniMax's anthropic-compatible endpoint historically accepted the
+        split form too, so this fix is strictly more conformant — no
+        regression for existing MiniMax users.
+
         Args:
-            messages: List of internal Message objects
+            messages: List of internal Message objects.
 
         Returns:
-            Tuple of (system_message, api_messages)
+            Tuple of (system_message, api_messages).
         """
-        system_message = None
-        api_messages = []
+        system_message: str | None = None
+        api_messages: list[dict[str, Any]] = []
+        pending_tool_results: list[dict[str, Any]] = []
+
+        def flush_tool_results() -> None:
+            """Emit accumulated tool_result blocks as one user message."""
+            if pending_tool_results:
+                api_messages.append({
+                    "role": "user",
+                    "content": list(pending_tool_results),
+                })
+                pending_tool_results.clear()
 
         for msg in messages:
             if msg.role == "system":
                 system_message = msg.content
                 continue
 
-            # For user and assistant messages
-            if msg.role in ["user", "assistant"]:
-                # Handle assistant messages with thinking or tool calls
-                if msg.role == "assistant" and (msg.thinking or msg.tool_calls):
-                    # Build content blocks for assistant with thinking and/or tool calls
-                    content_blocks = []
+            # Tool results: accumulate; do not flush until a non-tool
+            # message arrives. Multiple consecutive tool results from
+            # parallel tool calls collapse into a single user message.
+            if msg.role == "tool":
+                pending_tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": msg.tool_call_id,
+                    "content": msg.content,
+                })
+                continue
 
-                    # Add thinking block if present
+            # Any non-tool message implicitly flushes the pending batch
+            # (Anthropic requires tool_results immediately after tool_use).
+            flush_tool_results()
+
+            # User / assistant messages.
+            if msg.role in ("user", "assistant"):
+                if msg.role == "assistant" and (msg.thinking or msg.tool_calls):
+                    content_blocks: list[dict[str, Any]] = []
+
                     if msg.thinking:
                         content_blocks.append({"type": "thinking", "thinking": msg.thinking})
 
-                    # Add text content if present
                     if msg.content:
                         content_blocks.append({"type": "text", "text": msg.content})
 
-                    # Add tool use blocks
                     if msg.tool_calls:
                         for tool_call in msg.tool_calls:
                             content_blocks.append(
@@ -188,21 +226,10 @@ class AnthropicClient(LLMClientBase):
                 else:
                     api_messages.append({"role": msg.role, "content": msg.content})
 
-            # For tool result messages
-            elif msg.role == "tool":
-                # Anthropic uses user role with tool_result content blocks
-                api_messages.append(
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": msg.tool_call_id,
-                                "content": msg.content,
-                            }
-                        ],
-                    }
-                )
+        # End of message list: flush any trailing tool_results so they
+        # don't get silently dropped (rare — would mean the conversation
+        # ends on a tool result, which the model never sees).
+        flush_tool_results()
 
         return system_message, api_messages
 

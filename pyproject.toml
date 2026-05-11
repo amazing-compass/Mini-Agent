@@ -21,6 +21,10 @@ dependencies = [
     "pipx>=1.8.0",
     "anthropic>=0.39.0",
     "openai>=1.57.4",
+    "datasets>=4.8.5",
+    "gitpython>=3.1.49",
+    "sb-cli>=0.1.5",
+    "swebench>=4.1.0",
 ]
 
 [project.scripts]
