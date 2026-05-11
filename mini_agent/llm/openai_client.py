@@ -132,6 +132,13 @@ class OpenAIClient(LLMClientBase):
     def _convert_messages(self, messages: list[Message]) -> tuple[str | None, list[dict[str, Any]]]:
         """Convert internal messages to OpenAI format.
 
+        OpenAI's chat completions API requires ``system.content`` to be
+        a single string. When the caller hands us an Anthropic-style
+        ``Message(role="system", content=[{type:"text", text:..., cache_control:...}, ...])``
+        we flatten the text blocks into one ``"\n\n"``-joined string and
+        drop ``cache_control`` (OpenAI auto-caches its own prefixes; the
+        marker would be a 400).
+
         Args:
             messages: List of internal Message objects
 
@@ -143,8 +150,18 @@ class OpenAIClient(LLMClientBase):
 
         for msg in messages:
             if msg.role == "system":
-                # OpenAI includes system message in messages array
-                api_messages.append({"role": "system", "content": msg.content})
+                # OpenAI includes system message in messages array. If the
+                # content is a list[dict] (Anthropic-style blocks),
+                # flatten to a single string and discard cache_control.
+                if isinstance(msg.content, list):
+                    text = "\n\n".join(
+                        block.get("text", "")
+                        for block in msg.content
+                        if isinstance(block, dict) and block.get("type") == "text"
+                    )
+                    api_messages.append({"role": "system", "content": text})
+                else:
+                    api_messages.append({"role": "system", "content": msg.content})
                 continue
 
             # For user messages
@@ -259,13 +276,36 @@ class OpenAIClient(LLMClientBase):
                     )
                 )
 
-        # Extract token usage from response
+        # Extract token usage from response. Two cache-aware shapes:
+        # - DeepSeek's OpenAI-compatible endpoint surfaces
+        #   ``prompt_cache_hit_tokens`` / ``prompt_cache_miss_tokens``.
+        # - OpenAI native uses ``prompt_tokens_details.cached_tokens``.
+        # Plain OpenAI (no cache detail) ends up with zeros, which is
+        # the same as today.
         usage = None
         if hasattr(response, "usage") and response.usage:
+            usage_obj = response.usage
+            prompt_total = getattr(usage_obj, "prompt_tokens", 0) or 0
+            completion_total = getattr(usage_obj, "completion_tokens", 0) or 0
+            total = getattr(usage_obj, "total_tokens", 0) or 0
+
+            cache_hit = getattr(usage_obj, "prompt_cache_hit_tokens", 0) or 0
+            cache_miss = getattr(usage_obj, "prompt_cache_miss_tokens", 0) or 0
+
+            if not cache_hit and not cache_miss:
+                details = getattr(usage_obj, "prompt_tokens_details", None)
+                if details is not None:
+                    cache_hit = getattr(details, "cached_tokens", 0) or 0
+                    if cache_hit:
+                        cache_miss = max(prompt_total - cache_hit, 0)
+
             usage = TokenUsage(
-                prompt_tokens=response.usage.prompt_tokens or 0,
-                completion_tokens=response.usage.completion_tokens or 0,
-                total_tokens=response.usage.total_tokens or 0,
+                prompt_tokens=prompt_total or (cache_hit + cache_miss),
+                completion_tokens=completion_total,
+                total_tokens=total,
+                cache_read_tokens=cache_hit,
+                cache_creation_tokens=0,
+                cache_miss_tokens=cache_miss,
             )
 
         # Fix: read real finish_reason from choices[0] instead of hardcoding "stop".
@@ -286,6 +326,8 @@ class OpenAIClient(LLMClientBase):
         tools: list[Any] | None = None,
         *,
         max_tokens: int | None = None,
+        attach_message_bp: bool = True,
+        enable_cache_control: bool = False,
     ) -> LLMResponse:
         """Generate response from OpenAI LLM.
 
@@ -293,10 +335,19 @@ class OpenAIClient(LLMClientBase):
             messages: List of conversation messages
             tools: Optional list of available tools
             max_tokens: Output budget for this call (computed by the router).
+            attach_message_bp: Accepted for interface parity; the OpenAI
+                protocol has no equivalent of Anthropic's BP #4, so the
+                flag is intentionally ignored.
+            enable_cache_control: Accepted for interface parity. OpenAI
+                auto-caches its own prefixes and does not honor Anthropic
+                ``cache_control`` markers. ``_convert_messages`` already
+                strips markers when flattening system lists, so this is a
+                no-op for OpenAI.
 
         Returns:
             LLMResponse containing the generated content
         """
+        del attach_message_bp, enable_cache_control  # interface parity only
         # Prepare request
         request_params = self._prepare_request(messages, tools)
         # Precedence: explicit caller → configured default → None

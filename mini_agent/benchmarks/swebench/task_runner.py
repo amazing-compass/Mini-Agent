@@ -131,6 +131,8 @@ def _build_router(config: Config) -> ModelRouter:
                 supports_tools=entry.supports_tools,
                 supports_thinking=entry.supports_thinking,
                 enabled=entry.enabled,
+                supports_explicit_cache_control=entry.supports_explicit_cache_control,
+                supports_automatic_context_cache=entry.supports_automatic_context_cache,
             )
         )
     if not nodes:
@@ -201,8 +203,18 @@ def _serialize_messages(agent: Agent) -> list[dict[str, Any]]:
     Pydantic models in ``mini_agent.schema`` already implement
     ``model_dump()``; we route through that and fall back to ``str()`` for
     anything exotic so trajectory dump never blocks the run.
+
+    Also surfaces the agent's current ``ContextSummary`` (if any) as a
+    synthetic leading entry so post-hoc analysis sees the compacted
+    history instead of only the live tail.
     """
     out: list[dict[str, Any]] = []
+    if agent.current_summary is not None:
+        out.append({
+            "role": "_compacted_summary",
+            "content": agent.current_summary.raw_text,
+            "user_goals": list(agent.current_summary.user_goals),
+        })
     for msg in agent.live_messages:
         try:
             out.append(msg.model_dump())
@@ -232,7 +244,7 @@ def _write_trajectory(
         "messages": _serialize_messages(agent),
         "patch": patch,
         "final_message": final_message,
-        "steps_taken": len(agent.live_messages),
+        "steps_taken": agent.llm_call_count,
         "api_total_tokens": agent.api_total_tokens,
         "duration_seconds": duration_seconds,
     }
@@ -353,7 +365,7 @@ async def run_single_task(
             )
             final_message = "(timed out)"
 
-        steps_taken = len(agent.live_messages)
+        steps_taken = agent.llm_call_count
         api_total_tokens = agent.api_total_tokens
 
         # ----- 7. patch extraction --------------------------------------

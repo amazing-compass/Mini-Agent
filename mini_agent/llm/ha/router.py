@@ -8,17 +8,18 @@ Phase 2 adds:
   transition, record_success/record_failure accounting, event-time
   ContextOverflow fallthrough.
 - `internal_call(messages, tools)` — strict read-only bypass for the
-  agent's L4 summary: picks the highest-priority **serving** node
-  (closed / half-open), no on_attempt, no record_*, no failover, no
-  fits pre-check. Failures bubble up so the agent can degrade to "no
-  summary" without poisoning health.
+  agent's cache-aligned summary: picks the highest-priority **serving**
+  node (closed / half-open), no on_attempt, no record_*, no failover,
+  no fits pre-check. Failures bubble up so the agent can degrade to
+  "no summary" without poisoning health.
 - `execute(fn)` (Phase 1 API) is preserved for callers that need to
   drive custom per-node lambdas directly (tests, ad-hoc scripts).
 
 The router never compresses `messages`. ContextOverflowError is always
 raised back to the agent — whether it came from the pre-flight bucket
 classification ("healthy but doesn't fit") or from provider response
-("estimator under-counted"). The agent owns the L1/L2/L4 retry loop.
+("estimator under-counted"). The agent owns the ContextOverflow
+recovery loop.
 """
 
 from __future__ import annotations
@@ -100,6 +101,21 @@ class ModelRouter:
     # ------------------------------------------------------------------
     # Phase 2 primary API: .call / .internal_call
     # ------------------------------------------------------------------
+
+    def peek_primary_node(self) -> ModelNode | None:
+        """Return the highest-priority enabled node, or None if pool is empty.
+
+        Read-only — does not mutate breaker state, does not check fits,
+        and never represents the node that will actually serve any
+        specific call (failover can pick a different one). Agent uses
+        this once at ``__init__`` to cache a node for pricing lookups.
+        Tie-break is deterministic on node_id ascending so two runs of
+        the same config pick the same node.
+        """
+        enabled = self.pool.enabled()
+        if not enabled:
+            return None
+        return min(enabled, key=lambda n: (-n.priority, n.node_id))
 
     async def call(
         self,
@@ -273,11 +289,15 @@ class ModelRouter:
                     messages,
                     tools,
                     max_tokens=actual_max_tokens,
+                    attach_message_bp=True,
+                    enable_cache_control=getattr(
+                        node, "supports_explicit_cache_control", False
+                    ),
                 )
             except ContextOverflowError:
                 # Event-time capacity belongs to the agent — don't try
-                # a different node, don't compress; the agent's L1/L2/L4
-                # path is the right recovery.
+                # a different node, don't compress; the agent's
+                # ContextOverflow recovery path is the right one.
                 raise
             except BadRequestError:
                 # Program bug — do not mask by trying the next node.
@@ -328,7 +348,7 @@ class ModelRouter:
         messages: list[Any],
         tools: list[Any] | None = None,
     ) -> Any:
-        """Read-only bypass for the agent's L4 summary.
+        """Read-only bypass for the agent's cache-aligned summary call.
 
         Strict semantics (design §5.9):
         - filter by `is_serving()` — open nodes (including cooldown-elapsed)
@@ -352,11 +372,17 @@ class ModelRouter:
 
         client = self.pool.get_client(node.node_id)
         # Use the node's declared max_output_tokens as the summary budget;
-        # the L4 prompt is modest and compression summaries are short.
+        # the summary prompt is modest and summaries are short.
+        # Critical: summary calls never attach BP #4 — the dropped prefix
+        # has no future reader, so a cache_write here would be pure cost.
         return await client.generate(
             messages,
             tools,
             max_tokens=node.max_output_tokens,
+            attach_message_bp=False,
+            enable_cache_control=getattr(
+                node, "supports_explicit_cache_control", False
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -498,7 +524,7 @@ class ModelRouter:
     ) -> list[Any]:
         """Return a **copy** of messages safe to send to `target_family`.
 
-        Two transformations, always applied on a cross-family hop:
+        Three transformations, always applied on a cross-family hop:
 
         1. **Strip `thinking`** (design §6.1 diff 2). Anthropic's
            `thinking` content-block has no OpenAI analog; replaying it
@@ -511,6 +537,14 @@ class ModelRouter:
            both reject the payload with a 400. We drop the assistant's
            orphan tool_call entries (keeping matched ones), and drop any
            `tool` messages whose `tool_call_id` has no upstream tool_use.
+
+        3. **Strip `cache_control` from any list-shape content blocks**
+           (IMPROVEMENT_04 §6.10). When the Anthropic-family caller
+           handed us a structured system message (``content=list[dict]``)
+           with cache markers, the OpenAI client cannot accept the
+           markers — and may not even accept a list. The system message
+           gets flattened to a single string; any other ``cache_control``
+           keys on user/assistant content blocks are removed defensively.
 
         Messages are deep-copied so the caller's view (and future same-
         family attempts on unchanged messages) is untouched.
@@ -549,6 +583,39 @@ class ModelRouter:
                 continue
 
             new_msg = copy.deepcopy(msg)
+
+            # Strip `cache_control` from any structured content blocks,
+            # and flatten a list-shape system message to a single string.
+            # OpenAI's API does not accept either of these.
+            content = getattr(new_msg, "content", None)
+            if isinstance(content, list):
+                if role == "system":
+                    text = "\n\n".join(
+                        block.get("text", "")
+                        for block in content
+                        if isinstance(block, dict) and block.get("type") == "text"
+                    )
+                    try:
+                        new_msg.content = text
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to flatten system content on cross-family hop: %s",
+                            e,
+                        )
+                else:
+                    cleaned = [
+                        ({k: v for k, v in block.items() if k != "cache_control"}
+                         if isinstance(block, dict) else block)
+                        for block in content
+                    ]
+                    try:
+                        new_msg.content = cleaned
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to strip cache_control on cross-family hop: %s",
+                            e,
+                        )
+
             # Strip `thinking` unconditionally (it's the Anthropic-only
             # block; OpenAI-side `reasoning_details` will be regenerated
             # on the next assistant turn from the new provider).

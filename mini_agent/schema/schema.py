@@ -38,15 +38,24 @@ class Message(BaseModel):
 
 
 class TokenUsage(BaseModel):
-    """Token usage statistics from LLM API response."""
+    """Token usage statistics from LLM API response.
+
+    ``prompt_tokens`` keeps its original semantics: total input tokens
+    (uncached + cache_read + cache_creation). The new fields are
+    *additional* breakdowns, not replacements, so downstream callers
+    that only read ``prompt_tokens`` keep working.
+    """
 
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
+    cache_miss_tokens: int = 0
 
 
 class ContextSummary(BaseModel):
-    """L4 compression product, independent of Message."""
+    """Cache-aligned compaction product, independent of Message."""
 
     covered_rounds: list[int]  # Which rounds are covered (e.g. [1,2,3,4,5])
     user_goals: list[str]  # Original user prompts (preserved losslessly)

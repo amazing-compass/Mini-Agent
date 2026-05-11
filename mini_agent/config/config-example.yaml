@@ -95,6 +95,27 @@ pool:
 #     model: gpt-5
 #     priority: 80
 
+# # Example — DeepSeek V4 Pro (automatic Context Caching; no explicit cache_control marker):
+# pool:
+#   - node_id: deepseek-primary
+#     provider: anthropic
+#     api_key_env: DEEPSEEK_API_KEY
+#     api_base: https://api.deepseek.com/anthropic
+#     model: deepseek-v4-pro
+#     priority: 100
+#     supports_explicit_cache_control: false   # DeepSeek's Anthropic-compat endpoint ignores cache_control
+#     supports_automatic_context_cache: true   # Enable the DP's hit/miss pricing path
+#
+# # And the same DeepSeek node via the OpenAI-compatible endpoint:
+# # - node_id: deepseek-openai
+# #   provider: openai
+# #   api_key_env: DEEPSEEK_API_KEY
+# #   api_base: https://api.deepseek.com/v1
+# #   model: deepseek-v4-pro
+# #   priority: 80
+# #   supports_explicit_cache_control: false
+# #   supports_automatic_context_cache: true
+
 # ===== Agent Configuration =====
 # Blessed form is a nested `agent:` block — it mirrors the object shape
 # used at runtime (`config.agent.max_steps`, etc.). Writing these keys

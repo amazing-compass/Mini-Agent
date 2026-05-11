@@ -2,8 +2,8 @@
 
 `TokenBudget` lives on the router's side of the agent/router boundary —
 it only estimates and answers "does this request fit in that node?".
-All **compression** decisions (L1/L2/L4) stay in the agent; the router
-never calls TokenBudget to mutate `messages`.
+All **compaction** decisions (DP + emergency truncate) stay in the
+agent; the router never calls TokenBudget to mutate `messages`.
 
 Estimation uses tiktoken's cl100k_base encoder, which covers GPT-4,
 Claude, and most MiniMax models within a 5-15% error band. That error

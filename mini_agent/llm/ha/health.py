@@ -10,8 +10,8 @@ Three interfaces follow the command-query-separation pattern (§3.4):
       `Router.call`'s pre-scan bucket classification.
     * `is_serving(node_id)`   — pure read; "is the node actually serving
       right now" (closed OR half-open only). Stricter; used by
-      `Router.internal_call` (the L4 summary bypass) so it never burns a
-      probe slot.
+      `Router.internal_call` (the cache-aligned summary bypass) so it
+      never burns a probe slot.
     * `on_attempt(node_id)`   — write; the only place that performs the
       open → half-open transition. Business main loop calls it
       immediately before `client.generate(...)`.

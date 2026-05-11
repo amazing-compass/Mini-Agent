@@ -205,10 +205,6 @@ mini-agent
 mini-agent --workspace /path/to/your/project
 ```
 
-> 📖 更多开发指引，请参阅 [开发指南](docs/DEVELOPMENT_GUIDE_CN.md)
-
-> 📖 更多生产部署指引，请参阅 [生产指南](docs/PRODUCTION_GUIDE_CN.md)
-
 ## ACP & Zed Editor 集成（可选）
 
 Mini Agent 支持 [Agent Communication Protocol (ACP)](https://github.com/modelcontextprotocol/protocol)，可与 Zed 等代码编辑器集成。
@@ -245,19 +241,13 @@ Mini Agent 支持 [Agent Communication Protocol (ACP)](https://github.com/modelc
 
 *在这个演示中，我们要求 Agent 创建一个简洁美观的网页并在浏览器中显示它，以此展示基础的工具使用循环。*
 
-![演示动图 1: 基础任务执行](docs/assets/demo1-task-execution.gif "基础任务执行演示")
-
 ### 使用 Claude Skill（例如：PDF 生成）
 
 *这里，Agent 利用 Claude Skill 根据用户请求创建专业文档（如 PDF 或 DOCX），展示了其强大的高级能力。*
 
-![演示动图 2: Claude Skill 使用](docs/assets/demo2-claude-skill.gif "Claude Skill 使用演示")
-
 ### 网页搜索与摘要（MCP 工具）
 
 *此演示展示了 Agent 如何使用其网页搜索工具在线查找最新信息，并为用户进行总结。*
-
-![演示动图 3: 网页搜索](docs/assets/demo3-web-search.gif "网页搜索演示")
 
 
 ## 测试
@@ -309,11 +299,6 @@ pip install --upgrade certifi
 cd Mini-Agent
 python -m mini_agent.cli
 ```
-
-## 相关文档
-
-- [开发指南](docs/DEVELOPMENT_GUIDE_CN.md) - 详细的开发和配置指引
-- [生产环境指南](docs/PRODUCTION_GUIDE_CN.md) - 生产部署最佳实践
 
 ## 社区
 

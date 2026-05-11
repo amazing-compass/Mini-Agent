@@ -92,6 +92,11 @@ class ModelNodeConfig(BaseModel):
     supports_tools: bool = True
     supports_thinking: bool = True
     enabled: bool = True
+    # Cache capability flags. Defaults False so unknown providers are
+    # treated conservatively (the DP compaction policy then assumes
+    # cache_read == cache_write == input).
+    supports_explicit_cache_control: bool = False
+    supports_automatic_context_cache: bool = False
 
 
 class LLMConfig(BaseModel):
@@ -231,6 +236,12 @@ def _build_pool_entries(pool_raw: list[dict[str, Any]]) -> list[ModelNodeConfig]
             supports_tools=bool(raw.get("supports_tools", True)),
             supports_thinking=bool(raw.get("supports_thinking", True)),
             enabled=bool(raw.get("enabled", True)),
+            supports_explicit_cache_control=bool(
+                raw.get("supports_explicit_cache_control", False)
+            ),
+            supports_automatic_context_cache=bool(
+                raw.get("supports_automatic_context_cache", False)
+            ),
         )
         entries.append(entry)
     return entries

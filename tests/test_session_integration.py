@@ -54,9 +54,17 @@ def test_multi_turn_conversation(mock_router, temp_workspace):
     # Verify initial state
     assert len(agent.messages) == 1  # Only system prompt
     assert agent.messages[0].role == "system"
-    # Agent automatically adds workspace info to system prompt
-    assert system_prompt in agent.messages[0].content
-    assert "Current Workspace" in agent.messages[0].content
+    # Agent automatically adds workspace info to system prompt.
+    # IMPROVEMENT_04: system content is now a list of structured blocks
+    # ([{type:"text", text:..., cache_control:...}, ...]) instead of a
+    # plain string. Concatenate the text fields for substring search.
+    system_text = "".join(
+        block.get("text", "")
+        for block in agent.messages[0].content
+        if isinstance(block, dict)
+    )
+    assert system_prompt in system_text
+    assert "Current Workspace" in system_text
 
     # Add first user message
     agent.add_user_message("Hello")

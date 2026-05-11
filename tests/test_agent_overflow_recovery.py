@@ -84,7 +84,7 @@ def _make_agent(workspace: str, token_limit: int, fake: FakeRouter) -> Agent:
 
 def _seed_live_messages(agent: Agent, rounds: int = 4) -> None:
     """Populate agent.live_messages with N user/assistant round pairs so
-    `_full_compress` has something to fold."""
+    `_maybe_run_compaction` has something to fold."""
     for i in range(rounds):
         agent.live_messages.append(Message(role="user", content=f"user turn {i}"))
         agent.live_messages.append(
@@ -96,40 +96,47 @@ async def test_overflow_recovery_runs_l4_even_when_local_estimate_fits() -> None
     """Regression: Codex P2.
 
     When the router overflows but agent's `_estimate_tokens() <= token_limit`,
-    the old code would skip `_full_compress()` and retry the same prompt.
-    The new path must call `_full_compress()` unconditionally on recovery.
+    the old code would skip `_maybe_run_compaction()` and retry the same prompt.
+    The new path must call `_maybe_run_compaction()` unconditionally on recovery.
     """
     with tempfile.TemporaryDirectory() as ws:
         fake = FakeLLMClient(overflow_times=1)
         # token_limit is deliberately huge so `_estimate_tokens()` is
         # way under — the old gate `if _estimate_tokens() > token_limit`
-        # would have been False, skipping L4.
+        # would have been False, skipping the summary call.
         agent = _make_agent(ws, token_limit=100_000_000, fake=fake)
         _seed_live_messages(agent, rounds=4)
 
         result = await agent._generate_with_overflow_recovery(tool_list=[])
 
         assert result.content == "done"
-        # L4 invoked exactly once → internal_call was used by _create_structured_summary.
+        # Summary invoked exactly once → internal_call was used by
+        # _run_cache_aligned_summary.
         assert fake.internal_calls == 1, (
-            f"expected 1 internal_call for L4 summary, got {fake.internal_calls}"
+            f"expected 1 internal_call for cache-aligned summary, got {fake.internal_calls}"
         )
         # Two generate attempts: the overflowing one + the successful retry.
         assert fake.generate_calls == 2
 
 
-async def test_overflow_recovery_second_overflow_propagates() -> None:
-    """If compression + retry still overflows, surface it — don't loop forever."""
+async def test_overflow_recovery_third_overflow_propagates() -> None:
+    """If compression + emergency-truncation + retry still overflows, surface it.
+
+    IMPROVEMENT_04 §3.6 defines a 3-attempt recovery:
+        call -> forced compact -> call -> emergency truncate -> call.
+    If all three attempts overflow the agent has nothing left, so we
+    propagate.
+    """
     with tempfile.TemporaryDirectory() as ws:
-        fake = FakeLLMClient(overflow_times=2)  # both attempts overflow
+        fake = FakeLLMClient(overflow_times=3)  # all three attempts overflow
         agent = _make_agent(ws, token_limit=100_000_000, fake=fake)
         _seed_live_messages(agent, rounds=4)
 
         with pytest.raises(ContextOverflowError):
             await agent._generate_with_overflow_recovery(tool_list=[])
 
-        # Only two attempts — no silent loop.
-        assert fake.generate_calls == 2
+        # Exactly three attempts — no silent loop.
+        assert fake.generate_calls == 3
 
 
 async def test_overflow_recovery_happy_path_no_compression_needed() -> None:

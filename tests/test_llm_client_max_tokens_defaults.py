@@ -23,7 +23,15 @@ def test_base_client_default_max_tokens_is_none() -> None:
     """No universal cap — subclasses decide their own legacy fallback."""
 
     class _Dummy(LLMClientBase):
-        async def generate(self, messages, tools=None, *, max_tokens=None):
+        async def generate(
+            self,
+            messages,
+            tools=None,
+            *,
+            max_tokens=None,
+            attach_message_bp=True,
+            enable_cache_control=False,
+        ):
             return None
 
         def _prepare_request(self, messages, tools=None):

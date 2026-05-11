@@ -9,7 +9,8 @@ optional cross-protocol-family failover:
 - TokenBudget + three-bucket routing (healthy×fits / healthy-no-fit /
   unhealthy) so context-overflow never gets mistaken for node failure
 - Typed error hierarchy so retry/router don't see SDK exceptions
-- Router.internal_call bypass for agent-internal LLM calls (L4 summary)
+- Router.internal_call bypass for agent-internal LLM calls
+  (cache-aligned summary)
 - Cross-family failover (opt-in via `routing.cross_family_fallback`):
   drops `thinking` and cleans up orphan `tool_use` blocks before
   handing `messages` to a different protocol family.

@@ -41,9 +41,23 @@ class _Recording:
         self.outcomes = list(outcomes)
         self.calls: list[dict] = []
 
-    async def generate(self, messages, tools=None, *, max_tokens=None):
+    async def generate(
+        self,
+        messages,
+        tools=None,
+        *,
+        max_tokens=None,
+        attach_message_bp=True,
+        enable_cache_control=False,
+    ):
         self.calls.append(
-            {"messages": list(messages), "tools": tools, "max_tokens": max_tokens}
+            {
+                "messages": list(messages),
+                "tools": tools,
+                "max_tokens": max_tokens,
+                "attach_message_bp": attach_message_bp,
+                "enable_cache_control": enable_cache_control,
+            }
         )
         if not self.outcomes:
             raise RuntimeError("ran out of scripted outcomes")

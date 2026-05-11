@@ -1,6 +1,7 @@
 """Agent run logger"""
 
 import json
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -19,26 +20,56 @@ class AgentLogger:
     def __init__(self):
         """Initialize logger
 
-        Logs are stored in ~/.mini-agent/log/ directory
+        Logs are stored in ~/.mini-agent/log/ directory by default. The
+        directory is only created lazily in :meth:`start_new_run`, so
+        construction has no filesystem side effects.
         """
-        # Use ~/.mini-agent/log/ directory for logs
+        # Preferred log directory; only materialized on start_new_run().
         self.log_dir = Path.home() / ".mini-agent" / "log"
-        self.log_dir.mkdir(parents=True, exist_ok=True)
-        self.log_file = None
+        self.log_file: Path | None = None
         self.log_index = 0
 
     def start_new_run(self):
-        """Start new run, create new log file"""
+        """Start new run, create new log file.
+
+        Tries the preferred ``~/.mini-agent/log`` directory first; on
+        ``OSError`` (e.g. read-only HOME / sandboxed test runs) falls back to
+        a system temp directory. If both attempts fail, ``self.log_file`` is
+        left as ``None`` and all subsequent ``log_*`` calls become no-ops.
+        """
+        self.log_index = 0
+        self.log_file = None
+
+        candidates = [
+            self.log_dir,
+            Path(tempfile.gettempdir()) / "mini-agent-log",
+        ]
+        chosen: Path | None = None
+        for candidate in candidates:
+            try:
+                candidate.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                continue
+            chosen = candidate
+            break
+
+        if chosen is None:
+            return
+
+        self.log_dir = chosen
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         log_filename = f"agent_run_{timestamp}.log"
-        self.log_file = self.log_dir / log_filename
-        self.log_index = 0
+        log_path = chosen / log_filename
 
-        # Write log header
-        with open(self.log_file, "w", encoding="utf-8") as f:
-            f.write("=" * 80 + "\n")
-            f.write(f"Agent Run Log - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write("=" * 80 + "\n\n")
+        try:
+            with open(log_path, "w", encoding="utf-8") as f:
+                f.write("=" * 80 + "\n")
+                f.write(f"Agent Run Log - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write("=" * 80 + "\n\n")
+        except OSError:
+            return
+
+        self.log_file = log_path
 
     def log_request(self, messages: list[Message], tools: list[Any] | None = None):
         """Log LLM request
@@ -47,6 +78,8 @@ class AgentLogger:
             messages: Message list
             tools: Tool list (optional)
         """
+        if self.log_file is None:
+            return
         self.log_index += 1
 
         # Build complete request data structure
@@ -97,6 +130,8 @@ class AgentLogger:
             tool_calls: Tool call list (optional)
             finish_reason: Finish reason (optional)
         """
+        if self.log_file is None:
+            return
         self.log_index += 1
 
         # Build complete response data structure
@@ -143,6 +178,8 @@ class AgentLogger:
             permission_reason: The decision's rationale from
                 :class:`PermissionDecision`.
         """
+        if self.log_file is None:
+            return
         self.log_index += 1
 
         # Build complete tool execution result data structure
@@ -186,6 +223,6 @@ class AgentLogger:
             f.write("-" * 80 + "\n")
             f.write(content + "\n")
 
-    def get_log_file_path(self) -> Path:
-        """Get current log file path"""
+    def get_log_file_path(self) -> Path | None:
+        """Get current log file path (``None`` when logging was disabled)."""
         return self.log_file

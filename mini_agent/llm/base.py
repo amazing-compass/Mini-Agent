@@ -63,6 +63,8 @@ class LLMClientBase(ABC):
         tools: list[Any] | None = None,
         *,
         max_tokens: int | None = None,
+        attach_message_bp: bool = True,
+        enable_cache_control: bool = False,
     ) -> LLMResponse:
         """Generate response from LLM.
 
@@ -72,6 +74,16 @@ class LLMClientBase(ABC):
             max_tokens: Output budget for this call. Router always passes
                 an explicit value; direct callers may omit and fall back
                 to `self.default_max_tokens`.
+            attach_message_bp: Whether to attach an Anthropic cache_control
+                breakpoint to the last stable assistant message. Main-path
+                calls (``router.call``) keep the default ``True``; the
+                summary bypass (``router.internal_call``) passes ``False``
+                so dropped messages aren't paid for as cache_write entries
+                that no future request will read.
+            enable_cache_control: Whether the target node supports Anthropic
+                explicit ``cache_control`` markers. When ``False`` the
+                client strips/skips all marker injection regardless of
+                ``attach_message_bp`` (DeepSeek, OpenAI, MiniMax, etc.).
 
         Returns:
             LLMResponse containing the generated content, thinking, and tool calls

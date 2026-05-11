@@ -22,6 +22,24 @@ from mini_agent.schema import FunctionCall, LLMResponse, ToolCall
 # ---------------------------------------------------------------------------
 
 
+def _system_text(rendered_msg) -> str:
+    """Flatten the (post-IMPROVEMENT_04) list-of-blocks system content.
+
+    The agent now emits ``Message(role="system", content=list[dict])`` so
+    callers can attach cache_control to specific sections; tests that
+    just want to substring-match the rendered system prompt go through
+    this helper.
+    """
+    content = rendered_msg.content
+    if isinstance(content, str):
+        return content
+    return "".join(
+        block.get("text", "")
+        for block in content
+        if isinstance(block, dict)
+    )
+
+
 def _tool_call(tool_name: str, args: dict, call_id: str = "call_1") -> ToolCall:
     return ToolCall(
         id=call_id,
@@ -76,14 +94,13 @@ class TestRenderForProvider:
     def test_no_plan_section_when_empty(self, temp_workspace: str):
         agent, _planner = _make_agent(temp_workspace)
         rendered = agent.render_for_provider()
-        system_content = rendered[0].content
-        assert "## Current Plan" not in system_content
+        assert "## Current Plan" not in _system_text(rendered[0])
 
     def test_plan_section_appears_once_plan_is_written(self, temp_workspace: str):
         agent, planner = _make_agent(temp_workspace)
         planner.update([{"content": "Do thing", "status": "pending"}])
         rendered = agent.render_for_provider()
-        system_content = rendered[0].content
+        system_content = _system_text(rendered[0])
         assert "## Current Plan" in system_content
         assert "Do thing" in system_content
 
@@ -93,7 +110,7 @@ class TestRenderForProvider:
         # Fast-forward the stale counter.
         planner.state.rounds_since_update = PLAN_REMINDER_INTERVAL + 2
         rendered = agent.render_for_provider()
-        assert "<reminder>" in rendered[0].content
+        assert "<reminder>" in _system_text(rendered[0])
 
     def test_agent_without_planner_renders_normally(self, temp_workspace: str):
         """Sanity: agents built without a PlanningManager render identically
@@ -105,7 +122,7 @@ class TestRenderForProvider:
             workspace_dir=temp_workspace,
         )
         rendered = agent.render_for_provider()
-        assert "## Current Plan" not in rendered[0].content
+        assert "## Current Plan" not in _system_text(rendered[0])
 
 
 # ---------------------------------------------------------------------------
@@ -308,7 +325,7 @@ async def test_reminder_fires_after_direct_answer_turns(temp_workspace: str):
         await agent.run()
 
     assert planner.state.rounds_since_update >= PLAN_REMINDER_INTERVAL
-    reminder_section = agent.render_for_provider()[0].content
+    reminder_section = _system_text(agent.render_for_provider()[0])
     assert "<reminder>" in reminder_section
 
 
@@ -354,4 +371,4 @@ async def test_plan_visible_in_subsequent_render_after_context_reset(
     # Now simulate the CLI's /clear side-effect.
     planner.clear()
     rendered = agent.render_for_provider()
-    assert "## Current Plan" not in rendered[0].content
+    assert "## Current Plan" not in _system_text(rendered[0])

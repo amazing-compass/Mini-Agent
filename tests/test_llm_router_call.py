@@ -32,8 +32,24 @@ class FakeClient:
         self.outcomes = list(outcomes)  # list of value-or-Exception
         self.calls: list[dict] = []
 
-    async def generate(self, messages, tools=None, *, max_tokens=None):
-        self.calls.append({"messages": messages, "tools": tools, "max_tokens": max_tokens})
+    async def generate(
+        self,
+        messages,
+        tools=None,
+        *,
+        max_tokens=None,
+        attach_message_bp=True,
+        enable_cache_control=False,
+    ):
+        self.calls.append(
+            {
+                "messages": messages,
+                "tools": tools,
+                "max_tokens": max_tokens,
+                "attach_message_bp": attach_message_bp,
+                "enable_cache_control": enable_cache_control,
+            }
+        )
         if not self.outcomes:
             raise RuntimeError("FakeClient ran out of scripted outcomes")
         outcome = self.outcomes.pop(0)

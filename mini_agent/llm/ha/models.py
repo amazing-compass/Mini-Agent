@@ -27,6 +27,12 @@ class ModelNode(BaseModel):
     supports_tools: bool = True
     supports_thinking: bool = True
     enabled: bool = True
+    # Cache capability flags (IMPROVEMENT_04). Both default to False so
+    # unknown providers are treated conservatively. DeepSeek nodes set
+    # explicit=False + automatic=True; Anthropic-official sets
+    # explicit=True; MiniMax / fallback stay at the safe default.
+    supports_explicit_cache_control: bool = False
+    supports_automatic_context_cache: bool = False
 
 
 class NodeHealthSnapshot(BaseModel):

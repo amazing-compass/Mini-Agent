@@ -8,11 +8,17 @@ from typing import Any, Awaitable, Callable, Optional
 
 import tiktoken
 
+from .compaction import (
+    CachePolicy,
+    CompactionPolicy,
+    CompactionSnapshot,
+    ModelPricing,
+)
 from .llm.ha import ContextOverflowError, ModelRouter
 from .logger import AgentLogger
 from .permissions import PermissionDecision, PermissionManager
 from .planning import PlanningManager
-from .schema import ContextSummary, Message
+from .schema import ContextSummary, Message, TokenUsage
 from .tools.base import Tool, ToolResult
 from .utils import calculate_display_width
 
@@ -68,8 +74,8 @@ class Agent:
         """Phase 3: Agent directly owns a `ModelRouter` — no more facade.
 
         `router.call(messages, tools)` replaces the old `llm.generate`;
-        `router.internal_call(messages, tools)` replaces the L4 summary
-        path. Design §1.0 + §8.2 + §13.7 step 3.
+        `router.internal_call(messages, tools)` replaces the cache-aligned
+        summary path. Design §1.0 + §8.2 + §13.7 step 3.
 
         Permission system (optional):
           - ``permission_manager``: if ``None``, all tool calls are executed
@@ -101,25 +107,45 @@ class Agent:
         # Ensure workspace exists
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
 
-        # Inject workspace information into system prompt if not already present
+        # Inject workspace information into base system prompt (IMPROVEMENT_04):
+        # pinned notes are NOT baked into a persistent string anymore — they
+        # are rendered into system blocks at request time. So workspace info
+        # belongs in _base_system_prompt directly.
         if "Current Workspace" not in system_prompt:
             workspace_info = f"\n\n## Current Workspace\nYou are currently working in: `{self.workspace_dir.absolute()}`\nAll relative paths will be resolved relative to this directory."
             system_prompt = system_prompt + workspace_info
 
-        # Split internal storage: system_prompt / pinned_notes / cold_summaries / live_messages
-        self._base_system_prompt: str = system_prompt  # Original system prompt (without pinned notes)
-        self.system_prompt: str = system_prompt  # Current system prompt (with pinned notes)
-        self.pinned_notes: list[dict] = []  # Pinned meta-info
-        self.cold_summaries: list[ContextSummary] = []  # L4 summaries (can have multiple)
-        self.live_messages: list[Message] = []  # Recent raw messages
+        self._base_system_prompt: str = system_prompt
+        self.pinned_notes: list[dict] = []
+        # Single rolling summary (v1 simplification of cold_summaries).
+        self.current_summary: ContextSummary | None = None
+        self.live_messages: list[Message] = []
 
         # Initialize logger
         self.logger = AgentLogger()
 
-        # Token usage from last API response (updated after each LLM call)
+        # Token usage from last API response (updated after each LLM call).
         self.api_total_tokens: int = 0
-        # Flag to skip token check right after summary (avoid consecutive triggers)
-        self._skip_next_token_check: bool = False
+        # Last full TokenUsage object — used for cache-hit logging /
+        # diagnostics. Snapshot-time api_input estimate is computed from
+        # _estimate_tokens(), not from this.
+        self.last_usage: TokenUsage | None = None
+        # Counters for the DP NetBenefit formula.
+        self.compact_count: int = 0
+        self.llm_call_count: int = 0
+        self.user_turn_count: int = 0
+
+        # Cache the primary node once at startup for pricing lookups.
+        # Failover may pick a different node at call time; the spec
+        # accepts the resulting pricing skew (errs toward "less
+        # compaction", which is the safe direction).
+        self._primary_node = (
+            router.peek_primary_node() if hasattr(router, "peek_primary_node") else None
+        )
+        self.compaction_policy: CompactionPolicy = CompactionPolicy()
+        # Tokenizer encoder cached lazily for the agent's own counting
+        # helpers (separate from the policy's own encoder cache).
+        self._token_encoder = None
 
     # --- Backward-compatible messages property ---
 
@@ -131,46 +157,101 @@ class Agent:
     @messages.setter
     def messages(self, value: list[Message]):
         """Backward compatible: support agent.messages = [agent.messages[0]] for /clear."""
-        # /clear scenario: only keep system prompt
         if len(value) == 1 and value[0].role == "system":
+            # /clear path. Reset everything compaction-related so the
+            # next session starts at a true clean slate; pinned_notes
+            # survive by design (they're cross-session memory).
             self.live_messages = []
-            self.cold_summaries = []
-            # pinned_notes survive /clear
+            self.current_summary = None
+            self.compact_count = 0
+            self.llm_call_count = 0
+            self.user_turn_count = 0
+            self.last_usage = None
+            self.api_total_tokens = 0
             return
-        # Other scenarios: replace live_messages
         self.live_messages = [m for m in value if m.role != "system"]
 
     # --- Render for provider ---
 
-    def render_for_provider(self) -> list[Message]:
-        """Assemble internal storage into API-legal message sequence."""
-        result = []
+    def _render_system_blocks(self) -> list[dict]:
+        """Build Anthropic-shape system blocks ordered by change frequency.
 
-        # 1. System prompt (with pinned notes) + cold summaries (appended at render time)
-        system_content = self.system_prompt  # Already contains pinned notes
-        if self.cold_summaries:
-            merged = "\n\n---\n\n".join(s.raw_text for s in self.cold_summaries)
-            system_content += f"\n\n## Historical Summary\n{merged}"
+        Order: ``[base | BP#1] [pinned] [current_summary | BP#2] [current_plan]``.
 
-        # 2. Current session plan (after summaries, before live messages).
-        #    Empty string when there's no plan → append nothing.
+        BP #2 placement table:
+        - pinned + summary  →  BP #2 on the summary block
+        - pinned, no summary  →  BP #2 promoted to the pinned block
+        - no pinned, summary  →  BP #2 on the summary block
+        - neither  →  no BP #2 (early in the session; 3 BPs used)
+
+        BP #1 / BP #2 markers are only honored by Anthropic-explicit
+        nodes; other clients strip them. plan is intentionally last so
+        the high-frequency churn doesn't invalidate BP #2.
+        """
+        blocks: list[dict] = []
+
+        blocks.append({
+            "type": "text",
+            "text": self._base_system_prompt,
+            "cache_control": {"type": "ephemeral"},  # BP #1
+        })
+
+        pinned_block_idx: int | None = None
+        if self.pinned_notes:
+            pinned_text = "## Pinned Context (Important - Always Available)\n"
+            for note in self.pinned_notes:
+                cat = note.get("category", "general")
+                content = note.get("content", "")
+                pinned_text += f"- [{cat}] {content}\n"
+            blocks.append({"type": "text", "text": pinned_text})
+            pinned_block_idx = len(blocks) - 1
+
+        if self.current_summary is not None:
+            blocks.append({
+                "type": "text",
+                "text": f"## Historical Summary\n{self.current_summary.raw_text}",
+                "cache_control": {"type": "ephemeral"},  # BP #2 on summary
+            })
+        elif pinned_block_idx is not None:
+            # No summary but we do have pinned notes: promote pinned to BP #2.
+            blocks[pinned_block_idx]["cache_control"] = {"type": "ephemeral"}
+
         if self.planning_manager is not None:
             plan_section = self.planning_manager.render_for_prompt()
             if plan_section:
-                system_content += f"\n\n{plan_section}"
+                blocks.append({"type": "text", "text": plan_section})
 
-        result.append(Message(role="system", content=system_content))
+        return blocks
 
-        # 3. Recent raw messages
+    def render_for_provider(self) -> list[Message]:
+        """Assemble internal storage into an API-legal message sequence.
+
+        The system message uses Anthropic-shape ``content=list[dict]``.
+        Non-Anthropic clients flatten this to a string in their own
+        ``_convert_messages`` (see OpenAIClient).
+        """
+        result: list[Message] = []
+        result.append(Message(role="system", content=self._render_system_blocks()))
         result.extend(self.live_messages)
-
         return result
 
     # --- Message append methods ---
 
+    # Ingest-time truncation cap for oversized tool results
+    # (IMPROVEMENT_04 §3.3). Replaces the old
+    # ``CONTENT_TRUNCATE_KEEP_CHARS`` post-hoc emergency knob — this
+    # one fires at append time, before the message enters live_messages
+    # / the cache hash.
+    #
+    # 50_000 chars ≈ ~12K tokens on ASCII/code traffic. For Chinese-
+    # dense traffic (~3 bytes/char UTF-8) the per-message token count
+    # can triple; this is a known trade-off.
+    MAX_TOOL_RESULT_CHARS = 50_000
+
     def add_user_message(self, content: str):
         """Add a user message to history."""
         self.live_messages.append(Message(role="user", content=content))
+        self.user_turn_count += 1
 
     def _add_assistant_message(self, response) -> Message:
         """Add an assistant message from LLM response."""
@@ -184,10 +265,32 @@ class Agent:
         return msg
 
     def _add_tool_message(self, tool_call_id: str, function_name: str, result: ToolResult) -> Message:
-        """Add a tool result message."""
+        """Add a tool result message, truncating oversized payloads at ingest.
+
+        Critical: this truncation happens BEFORE the message enters
+        ``live_messages`` so the cache hash sees the truncated form on
+        the very first request. This is NOT the L1/L2 in-place rewrite
+        that the v0 design relied on — that path is gone.
+        """
+        content = result.content if result.success else f"Error: {result.error}"
+
+        if len(content) > self.MAX_TOOL_RESULT_CHARS:
+            original_len = len(content)
+            keep_head = int(self.MAX_TOOL_RESULT_CHARS * 0.7)
+            keep_tail = self.MAX_TOOL_RESULT_CHARS - keep_head - 200
+            head = content[:keep_head]
+            tail = content[-keep_tail:]
+            content = (
+                f"{head}\n\n"
+                f"...[truncated {original_len - keep_head - keep_tail} chars from middle; "
+                f"original {original_len} chars; "
+                f"if you need more, use Read with offset/limit, or re-run the tool with narrower scope]\n\n"
+                f"{tail}"
+            )
+
         msg = Message(
             role="tool",
-            content=result.content if result.success else f"Error: {result.error}",
+            content=content,
             tool_call_id=tool_call_id,
             name=function_name,
         )
@@ -284,277 +387,417 @@ class Agent:
         # Rough estimation: average 2.5 characters = 1 token
         return int(total_chars / 2.5)
 
-    # --- Three-level compression ---
+    # --- Cache-aware compaction (IMPROVEMENT_04) ---
 
-    async def _compress_context(self):
-        """Three-level compression (preventive + forced).
+    # SUMMARY_INSTRUCTION is a session-level constant string per §3.5.4
+    # Version A. Explicit "either fresh or merge" branches eliminate the
+    # silent-bug risk where an unguided LLM occasionally drops the prior
+    # summary on the floor. Keep it deterministic — no round numbers, no
+    # timestamps; those would invalidate the cache prefix.
+    SUMMARY_INSTRUCTION = (
+        'The system prompt above may contain a "Historical Summary" section '
+        "covering earlier rounds. The conversation above shows additional rounds "
+        "that haven't been summarized yet. Produce an UPDATED structured summary "
+        "that incorporates BOTH the prior summary (if present) and the new rounds, "
+        "in this EXACT format:\n\n"
+        "## Completed Work\n"
+        "- (list what was done)\n\n"
+        "## Active Files\n"
+        "- (list files that were read/written/modified, with status)\n\n"
+        "## Key Findings\n"
+        "- (list important discoveries or facts)\n\n"
+        "## Pending / TODO\n"
+        "- (list unfinished work or next steps)\n\n"
+        "Requirements:\n"
+        "- Use the exact section headers above\n"
+        '- Each item starts with "- "\n'
+        "- Be concise, under 800 words total\n"
+        "- English only\n"
+        "- If no prior summary exists, produce a fresh summary covering only the conversation above"
+    )
 
-        Strategy:
-        - soft_limit (85%): trigger L1/L2 lightweight truncation early, near-zero cost
-        - hard_limit (100%): trigger L4 full LLM summary, higher cost
-        This avoids sudden context overflow; L1/L2 is usually sufficient.
-        """
-        if self._skip_next_token_check:
-            self._skip_next_token_check = False
-            return
-
-        estimated = self._estimate_tokens()
-        soft_limit = int(self.token_limit * 0.85)
-
-        # Below soft_limit, no compression needed
-        if estimated <= soft_limit and self.api_total_tokens <= soft_limit:
-            return
-
-        print(
-            f"\n{Colors.BRIGHT_YELLOW}📊 Token: local={estimated}, api={self.api_total_tokens}, "
-            f"soft={soft_limit}, hard={self.token_limit}{Colors.RESET}"
-        )
-
-        # L1: Truncate old tool results (non read_file), near-zero cost
-        self._truncate_old_tool_results(keep_recent_n=3)
-        estimated = self._estimate_tokens()
-        if estimated <= self.token_limit:
-            print(f"{Colors.BRIGHT_GREEN}✓ L1 sufficient: {estimated} tokens{Colors.RESET}")
-            return
-
-        # L2: Truncate old read_file results, near-zero cost
-        self._truncate_old_readfile_results(keep_recent_n=3)
-        estimated = self._estimate_tokens()
-        if estimated <= self.token_limit:
-            print(f"{Colors.BRIGHT_GREEN}✓ L2 sufficient: {estimated} tokens{Colors.RESET}")
-            return
-
-        # L4: Full compression (keep recent N rounds), only when truly over hard limit
-        await self._full_compress(keep_recent_n=3)
-        self._skip_next_token_check = True
-
-        # Post-L4 safety: the kept rounds themselves may still exceed the limit.
-        # Step 1: L1/L2 with keep_recent_n=1 (protect only the latest round)
-        # Step 2: content-truncate oversized tool messages (last resort)
-        estimated = self._estimate_tokens()
-        if estimated > self.token_limit:
-            print(
-                f"{Colors.BRIGHT_YELLOW}⚠️  Post-L4 still over limit ({estimated} > {self.token_limit}), "
-                f"applying aggressive truncation{Colors.RESET}"
-            )
-            self._truncate_old_tool_results(keep_recent_n=1)
-            self._truncate_old_readfile_results(keep_recent_n=1)
-            estimated = self._estimate_tokens()
-            if estimated > self.token_limit:
-                # Oversized tool results in current round — content-truncate them
-                self._content_truncate_large_tool_results()
-                estimated = self._estimate_tokens()
-            print(f"{Colors.BRIGHT_GREEN}✓ Post-L4 cleanup: {estimated} tokens{Colors.RESET}")
-
-    def _get_round_boundary(self, keep_recent_n: int) -> int:
-        """Return the starting index in live_messages for the most recent N rounds.
-        One round = one user message to the next user message (all messages in between).
-        """
-        user_indices = [
-            i for i, msg in enumerate(self.live_messages) if msg.role == "user"
-        ]
-        if len(user_indices) <= keep_recent_n:
-            return 0  # Not enough rounds, keep all
-        # Starting index of the most recent N rounds' first user message
-        return user_indices[-keep_recent_n]
-
-    def _truncate_old_tool_results(self, keep_recent_n: int = 3):
-        """L1: Replace non-read_file tool results before N rounds with placeholders."""
-        boundary = self._get_round_boundary(keep_recent_n)
-        if boundary == 0:
-            return
-
-        count = 0
-        for msg in self.live_messages[:boundary]:
-            if msg.role == "tool" and msg.name and msg.name != "read_file":
-                # Avoid re-truncation
-                if not msg.content.startswith("[Previous "):
-                    failed = msg.content.startswith("Error:")
-                    status = "failed" if failed else "executed successfully"
-                    msg.content = f"[Previous {msg.name} {status}]"
-                    count += 1
-
-        if count > 0:
-            print(f"{Colors.BRIGHT_YELLOW}🔄 L1: truncated {count} old tool results{Colors.RESET}")
-
-    def _truncate_old_readfile_results(self, keep_recent_n: int = 3):
-        """L2: Replace read_file results before N rounds with path-bearing placeholders."""
-        boundary = self._get_round_boundary(keep_recent_n)
-        if boundary == 0:
-            return
-
-        # Build tool_call_id → arguments index (from assistant messages in live_messages)
-        args_index = {}
-        for msg in self.live_messages:
-            if msg.role == "assistant" and msg.tool_calls:
-                for tc in msg.tool_calls:
-                    args_index[tc.id] = tc.function.arguments
-
-        count = 0
-        for msg in self.live_messages[:boundary]:
-            if msg.role == "tool" and msg.name == "read_file":
-                if not msg.content.startswith("[Previous "):
-                    args = args_index.get(msg.tool_call_id, {})
-                    path = args.get("path", "unknown")
-                    offset = args.get("offset")
-                    limit = args.get("limit")
-                    if offset or limit:
-                        params = ", ".join(
-                            f"{k}={v}" for k, v in [("offset", offset), ("limit", limit)] if v
-                        )
-                        msg.content = f"[Previous read_file: {path} ({params})]"
-                    else:
-                        msg.content = f"[Previous read_file: {path}]"
-                    count += 1
-
-        if count > 0:
-            print(f"{Colors.BRIGHT_YELLOW}🔄 L2: truncated {count} old read_file results{Colors.RESET}")
-
-    # Characters to keep when content-truncating an oversized tool result.
-    # ~2000 chars ≈ ~500-800 tokens — enough for LLM to understand the gist.
     CONTENT_TRUNCATE_KEEP_CHARS = 2000
 
     def _content_truncate_large_tool_results(self):
-        """Last resort: truncate the *content* of oversized tool messages.
+        """Emergency-only: truncate the *content* of oversized tool messages.
 
-        Unlike L1/L2 which replace with placeholders, this keeps the first N
-        characters so the LLM still gets partial context.  Applied to ALL
-        tool messages in live_messages (including the current round).
+        This is the **only** in-place rewrite of ``live_messages`` that
+        survives IMPROVEMENT_04. It only runs from the overflow recovery
+        path AFTER a forced DP compaction failed to free enough room.
+        On the normal path the DP pipeline never touches this.
         """
         count = 0
         for msg in self.live_messages:
             if msg.role != "tool":
                 continue
-            if msg.content.startswith("[Previous "):
-                continue  # Already placeholder-truncated
-            if len(msg.content) > self.CONTENT_TRUNCATE_KEEP_CHARS * 2:
+            if isinstance(msg.content, str) and msg.content.startswith("[Previous "):
+                continue
+            if isinstance(msg.content, str) and len(msg.content) > self.CONTENT_TRUNCATE_KEEP_CHARS * 2:
                 msg.content = (
                     msg.content[:self.CONTENT_TRUNCATE_KEEP_CHARS]
                     + f"\n\n...[content truncated from {len(msg.content)} to "
                     f"{self.CONTENT_TRUNCATE_KEEP_CHARS} chars]"
                 )
                 count += 1
-
         if count > 0:
-            print(f"{Colors.BRIGHT_YELLOW}🔄 Content-truncated {count} oversized tool result(s){Colors.RESET}")
+            print(
+                f"{Colors.BRIGHT_YELLOW}🔄 Emergency: content-truncated {count} oversized tool result(s){Colors.RESET}"
+            )
 
-    async def _full_compress(self, keep_recent_n: int = 3):
-        """L4: Compress messages before N rounds into ContextSummary, keep recent N rounds."""
-        boundary = self._get_round_boundary(keep_recent_n)
-        if boundary == 0:
-            return
-
-        old_messages = self.live_messages[:boundary]
-        recent_messages = self.live_messages[boundary:]
-
-        # 1. Extract old user prompts (deterministic, zero-loss)
-        user_goals = [
-            msg.content for msg in old_messages
-            if msg.role == "user" and isinstance(msg.content, str)
-        ]
-
-        # 2. LLM structured summary
-        summary_text = await self._create_structured_summary(old_messages)
-
-        # 3. Parse structured summary (best-effort; fallback to raw_text)
-        summary = ContextSummary(
-            covered_rounds=list(range(1, len([m for m in old_messages if m.role == "user"]) + 1)),
-            user_goals=user_goals,
-            completed_work=self._parse_section(summary_text, "Completed Work"),
-            active_files=self._parse_section(summary_text, "Active Files"),
-            key_findings=self._parse_section(summary_text, "Key Findings"),
-            pending_todo=self._parse_section(summary_text, "Pending / TODO"),
-            raw_text=self._render_summary_text(user_goals, summary_text),
-        )
-
-        # 4. Append to cold_summaries, replace live_messages
-        self.cold_summaries.append(summary)
-        self.live_messages = recent_messages
-
-        print(
-            f"{Colors.BRIGHT_GREEN}✓ L4: compressed {len(old_messages)} messages → summary, "
-            f"kept {len(recent_messages)} recent{Colors.RESET}"
-        )
+    def _parse_section(self, text: str, section_name: str) -> list[str]:
+        """Pull bullet items out of a ``## Section Name`` block."""
+        lines = text.split("\n")
+        in_section = False
+        items: list[str] = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith(f"## {section_name}"):
+                in_section = True
+                continue
+            if in_section:
+                if stripped.startswith("## "):
+                    break
+                if stripped.startswith("- "):
+                    items.append(stripped[2:])
+        return items
 
     def _render_summary_text(self, user_goals: list[str], summary_text: str) -> str:
-        """Render user_goals + summary text into a full block (for render_for_provider)."""
-        parts = []
+        """Compose the final ``raw_text`` that lands in ``current_summary``."""
+        parts: list[str] = []
         if user_goals:
             goals_text = "\n".join(f"- {g}" for g in user_goals)
             parts.append(f"## User Goals\n{goals_text}")
         parts.append(summary_text)
         return "\n\n".join(parts)
 
-    def _parse_section(self, text: str, section_name: str) -> list[str]:
-        """Parse items from a specific section in structured summary text."""
-        lines = text.split("\n")
-        in_section = False
-        items = []
-        for line in lines:
-            if line.strip().startswith(f"## {section_name}"):
-                in_section = True
-                continue
-            if in_section:
-                if line.strip().startswith("## "):
-                    break
-                if line.strip().startswith("- "):
-                    items.append(line.strip()[2:])
-        return items
+    @staticmethod
+    def _merge_user_goals_preserving_order(
+        prior: list[str],
+        new: list[str],
+    ) -> list[str]:
+        """Deduplicate ``prior + new`` while keeping first-seen order.
 
-    async def _create_structured_summary(self, messages: list[Message]) -> str:
-        """Call LLM to generate a structured summary."""
-        content = ""
-        for msg in messages:
-            if msg.role == "assistant":
-                text = msg.content if isinstance(msg.content, str) else str(msg.content)
-                content += f"Assistant: {text}\n"
-                if msg.tool_calls:
-                    names = [tc.function.name for tc in msg.tool_calls]
-                    content += f"  → Tools: {', '.join(names)}\n"
-            elif msg.role == "tool":
-                content += f"  ← {msg.name}: {msg.content}\n"
+        Used by both the LLM-summary path and the deterministic fallback
+        path so the rendered ``raw_text`` and the ``user_goals`` field
+        share a single source of truth — otherwise the LLM could drop a
+        prior goal and the prompt-rendering path would silently lose it
+        (the field gets fixed up, but ``raw_text`` is what
+        ``_render_system_blocks`` actually sends to the model).
+        """
+        seen: set[str] = set()
+        merged: list[str] = []
+        for goal in (*prior, *new):
+            if goal not in seen:
+                seen.add(goal)
+                merged.append(goal)
+        return merged
 
-        prompt = f"""Summarize the following agent execution history in this EXACT format:
+    def _parse_structured_summary(
+        self,
+        summary_text: str,
+        dropped: list[Message],
+        *,
+        prior_user_goals: list[str] | None = None,
+    ) -> ContextSummary:
+        """Turn raw LLM markdown into a ContextSummary.
 
-## Completed Work
-- (list what was done)
-
-## Active Files
-- (list files that were read/written/modified, with status)
-
-## Key Findings
-- (list important discoveries or facts)
-
-## Pending / TODO
-- (list unfinished work or next steps)
-
----
-Execution history:
-
-{content}
-
-Requirements:
-- Use the exact section headers above
-- Each item starts with "- "
-- Be concise, under 800 words total
-- English only"""
-
-        summary_messages = [
-            Message(role="system", content="You summarize agent execution histories in structured format."),
-            Message(role="user", content=prompt),
+        ``prior_user_goals`` lets the caller preserve goals from the
+        existing ``current_summary`` even when the LLM drops them: we
+        merge BEFORE rendering ``raw_text`` so the rendered prompt and
+        the structured field can never disagree.
+        """
+        new_user_goals = [
+            msg.content
+            for msg in dropped
+            if msg.role == "user" and isinstance(msg.content, str)
         ]
-        # L4 summary goes through the router's **internal_call** bypass so
-        # a summary failure or cooldown-open node doesn't poison business
-        # node health or recurse back into compression (design §5.9).
-        try:
-            response = await self.router.internal_call(summary_messages)
-            return response.content
-        except Exception:
-            # Fallback: return truncated raw content
-            return (
-                f"## Completed Work\n- (Summary generation failed)\n\n"
-                f"## Key Findings\n- Raw content length: {len(content)} chars"
+        merged_user_goals = self._merge_user_goals_preserving_order(
+            prior_user_goals or [],
+            new_user_goals,
+        )
+        return ContextSummary(
+            covered_rounds=[self.compact_count + 1],
+            user_goals=merged_user_goals,
+            completed_work=self._parse_section(summary_text, "Completed Work"),
+            active_files=self._parse_section(summary_text, "Active Files"),
+            key_findings=self._parse_section(summary_text, "Key Findings"),
+            pending_todo=self._parse_section(summary_text, "Pending / TODO"),
+            raw_text=self._render_summary_text(merged_user_goals, summary_text),
+        )
+
+    def _count_value_tokens(self, value: object) -> int:
+        """Best-effort token count for a single string/dict/list value."""
+        if value is None:
+            return 0
+        enc = self._token_encoder
+        if enc is None:
+            try:
+                enc = tiktoken.get_encoding("cl100k_base")
+            except Exception:
+                # Fallback: rough character-based estimate (consistent
+                # with _estimate_tokens_fallback ratio of 2.5 chars/token).
+                if isinstance(value, str):
+                    return int(len(value) / 2.5)
+                return int(len(str(value)) / 2.5)
+            self._token_encoder = enc
+        if isinstance(value, str):
+            text = value
+        else:
+            text = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+        return len(enc.encode(text))
+
+    def _count_system_tokens(self) -> int:
+        """Token count of base + pinned + current_summary (NOT plan).
+
+        Plan is intentionally excluded from the DP stable-prefix V
+        estimate: it's the highest-churn block and the spec keeps it
+        outside BP #2 specifically so its churn doesn't invalidate the
+        summary cache.
+        """
+        pieces: list[object] = [self._base_system_prompt]
+        if self.pinned_notes:
+            pieces.append(self.pinned_notes)
+        if self.current_summary is not None:
+            pieces.append(self.current_summary.raw_text)
+        return sum(self._count_value_tokens(piece) + 4 for piece in pieces)
+
+    def _count_tools_tokens(self, tool_list: list) -> int:
+        """Token count for the tools schema array."""
+        schemas: list[object] = []
+        for tool in tool_list:
+            if isinstance(tool, dict):
+                schemas.append(tool)
+            elif hasattr(tool, "to_schema"):
+                schemas.append(tool.to_schema())
+            elif hasattr(tool, "to_openai_schema"):
+                schemas.append(tool.to_openai_schema())
+            else:
+                schemas.append(str(tool))
+        return self._count_value_tokens(schemas)
+
+    def _extract_file_paths_from_tool_args(
+        self,
+        messages: list[Message],
+    ) -> set[str]:
+        """Best-effort extraction of file paths from Read/Write/Edit tool calls."""
+        paths: set[str] = set()
+        path_keys = {"path", "file_path", "filepath", "filename", "target_file", "target_path"}
+        for msg in messages:
+            if not msg.tool_calls:
+                continue
+            for call in msg.tool_calls:
+                name = (call.function.name or "").lower()
+                if not any(marker in name for marker in ("read", "write", "edit", "file")):
+                    continue
+                args = call.function.arguments or {}
+                for key, value in args.items():
+                    if key in path_keys and isinstance(value, str) and value:
+                        paths.add(value)
+        return paths
+
+    def _build_deterministic_fallback_summary(
+        self,
+        dropped: list[Message],
+        *,
+        reason: str,
+        prior_user_goals: list[str] | None = None,
+    ) -> ContextSummary:
+        """Lossy but non-empty fallback when the LLM summary call fails on the forced path.
+
+        Captures user_goals verbatim (deterministic, zero-loss), records
+        which tools ran, and harvests file paths from tool args.
+
+        ``prior_user_goals`` keeps this path symmetric with
+        ``_parse_structured_summary``: both render ``raw_text`` from the
+        merged list so the rendered prompt can never lose prior goals.
+        """
+        new_user_goals = [
+            m.content for m in dropped
+            if m.role == "user" and isinstance(m.content, str)
+        ]
+        user_goals = self._merge_user_goals_preserving_order(
+            prior_user_goals or [],
+            new_user_goals,
+        )
+        tool_names: set[str] = set()
+        for msg in dropped:
+            if msg.tool_calls:
+                for tc in msg.tool_calls:
+                    if tc.function.name:
+                        tool_names.add(tc.function.name)
+        file_paths = self._extract_file_paths_from_tool_args(dropped)
+
+        completed_work = [
+            f"(LLM summary unavailable: {reason}; below is deterministic fallback)"
+        ]
+        key_findings: list[str] = []
+        if tool_names:
+            key_findings.append(f"Tools invoked: {', '.join(sorted(tool_names))}")
+
+        parts: list[str] = []
+        if user_goals:
+            parts.append("## User Goals\n" + "\n".join(f"- {g}" for g in user_goals))
+        parts.append("## Completed Work\n" + "\n".join(f"- {w}" for w in completed_work))
+        if file_paths:
+            parts.append("## Active Files\n" + "\n".join(f"- {p}" for p in sorted(file_paths)))
+        if key_findings:
+            parts.append("## Key Findings\n" + "\n".join(f"- {k}" for k in key_findings))
+
+        raw_text = "\n\n".join(parts)
+
+        return ContextSummary(
+            covered_rounds=[self.compact_count + 1],
+            user_goals=user_goals,
+            completed_work=completed_work,
+            active_files=sorted(file_paths),
+            key_findings=key_findings,
+            pending_todo=[],
+            raw_text=raw_text,
+        )
+
+    async def _run_cache_aligned_summary(
+        self,
+        dropped: list[Message],
+        *,
+        prior_user_goals: list[str] | None = None,
+    ) -> ContextSummary:
+        """Issue a summary LLM call that shares the main request's stable prefix.
+
+        Invariants:
+        - system blocks and tools are passed in the same order as the main
+          request so DeepSeek's automatic Context Caching / Anthropic's
+          explicit BP #1/#2/#3 can match.
+        - ``dropped`` is passed by reference — never deep-copied, never
+          mutated.
+        - Router.internal_call passes ``attach_message_bp=False``, so no
+          BP #4 lands on the dropped messages. This is the v1 invariant
+          that ``P_summary_input = P_input`` in the DP formula.
+        - The SUMMARY_INSTRUCTION is appended as a single user message at
+          the very end — the only new bytes vs. the main request.
+
+        ``prior_user_goals`` is forwarded to ``_parse_structured_summary``
+        so the returned summary's ``user_goals`` and ``raw_text`` both
+        reflect the merge of prior + new goals — defending against the
+        LLM silently dropping a prior goal during a merge call.
+        """
+        base_messages = self.render_for_provider()
+        system_msg = next((m for m in base_messages if m.role == "system"), None)
+        if system_msg is None:
+            raise RuntimeError("render_for_provider produced no system message")
+
+        summary_messages: list[Message] = [
+            system_msg,
+            *dropped,
+            Message(role="user", content=self.SUMMARY_INSTRUCTION),
+        ]
+
+        tool_list = list(self.tools.values())
+        response = await self.router.internal_call(summary_messages, tools=tool_list)
+        return self._parse_structured_summary(
+            response.content,
+            dropped,
+            prior_user_goals=prior_user_goals,
+        )
+
+    def _build_compaction_snapshot(self, tool_list: list) -> CompactionSnapshot:
+        """Read-only snapshot of agent state for the DP policy.
+
+        ``api_input_token_estimate`` is computed from the CURRENT
+        rendering, not from ``last_usage.prompt_tokens``: the latter
+        doesn't include tool_results that arrived after the last LLM
+        call, and we routinely add big Reads after the call.
+        """
+        api_estimate = self._estimate_tokens() + self._count_tools_tokens(tool_list)
+
+        pricing = CachePolicy.pricing_for_node(self._primary_node)
+        if (
+            self._primary_node is not None
+            and not getattr(self._primary_node, "supports_explicit_cache_control", False)
+            and not getattr(self._primary_node, "supports_automatic_context_cache", False)
+        ):
+            # Unknown / non-caching node: degrade pricing so the DP
+            # discount term collapses (cache_read == cache_write == input).
+            pricing = ModelPricing(
+                input=pricing.input,
+                cache_read=pricing.input,
+                cache_write=pricing.input,
+                output=pricing.output,
             )
+
+        return CompactionSnapshot(
+            live_messages=self.live_messages,
+            current_summary=self.current_summary,
+            system_token_count=self._count_system_tokens(),
+            tools_token_count=self._count_tools_tokens(tool_list),
+            pricing=pricing,
+            user_turn_count=self.user_turn_count,
+            llm_call_count=self.llm_call_count,
+            compact_count=self.compact_count,
+            api_input_token_estimate=api_estimate,
+            max_context=self.token_limit,
+        )
+
+    async def _maybe_run_compaction(
+        self,
+        tool_list: list,
+        *,
+        forced: bool = False,
+    ) -> None:
+        """DP-driven compaction. Splits live_messages, summarises dropped, swaps in current_summary."""
+        snapshot = self._build_compaction_snapshot(tool_list)
+        decision = self.compaction_policy.decide(snapshot, forced=forced)
+
+        if not decision.should_compact:
+            return
+
+        dropped = self.live_messages[: decision.drop_message_count]
+        kept = self.live_messages[decision.drop_message_count :]
+
+        # Snapshot prior goals BEFORE entering the try/except so both
+        # the LLM path and the deterministic fallback path see the same
+        # list. Both construction helpers merge prior+new and render
+        # raw_text from the merged list — keeping ``user_goals`` and
+        # ``raw_text`` in lock-step. (Updating only the field after the
+        # fact would leave raw_text stale, and raw_text is what
+        # ``_render_system_blocks`` actually sends to the model.)
+        prior_user_goals = (
+            list(self.current_summary.user_goals) if self.current_summary else []
+        )
+
+        try:
+            summary = await self._run_cache_aligned_summary(
+                dropped,
+                prior_user_goals=prior_user_goals,
+            )
+        except Exception as exc:
+            if forced:
+                # Forced path must move forward or it loops forever.
+                # Drop the dropped messages and use a deterministic fallback
+                # so user_goals + tool inventory survive.
+                summary = self._build_deterministic_fallback_summary(
+                    dropped,
+                    reason=str(exc),
+                    prior_user_goals=prior_user_goals,
+                )
+            else:
+                # Normal path: keep dropped, try again next step. The DP
+                # snapshot will re-decide whether compaction is still
+                # worth it.
+                print(
+                    f"{Colors.BRIGHT_YELLOW}⚠️  Summary failed; "
+                    f"deferring compaction: {exc}{Colors.RESET}"
+                )
+                return
+
+        self.current_summary = summary
+        self.live_messages = kept
+        self.compact_count += 1
+
+        print(
+            f"{Colors.BRIGHT_GREEN}✓ Compacted {len(dropped)} messages → summary "
+            f"(reason={decision.reason}, "
+            f"net_benefit=${decision.net_benefit:.4f}){Colors.RESET}"
+        )
 
     # ---- Router interop: ContextOverflowError recovery ----
 
@@ -565,8 +808,8 @@ Requirements:
         Agent should go through here instead of calling
         `self.router.call(...)` directly — otherwise the pre-flight
         `ContextOverflowError` surfaces as a hard crash instead of
-        triggering the L1/L2/L4 compression + retry flow defined by
-        design §5.7.
+        triggering the forced DP compaction + emergency truncation retry
+        flow defined by IMPROVEMENT_04 §3.6.
 
         The method is a thin wrapper around
         `_generate_with_overflow_recovery` and exists so the naming
@@ -575,27 +818,17 @@ Requirements:
         return await self._generate_with_overflow_recovery(tool_list)
 
     async def _generate_with_overflow_recovery(self, tool_list: list) -> Any:
-        """Call the LLM, recovering from ContextOverflowError via L1/L2/L4.
+        """Call the LLM, recovering from ContextOverflowError via forced compaction.
 
-        The router raises `ContextOverflowError` in two cases (design §5.7):
-        1. pre-flight: at least one healthy node exists but none fit the
-           current messages
-        2. event-time: a node accepted the request but the provider
-           responded with a 400 context_length_exceeded
+        Three-step recovery per IMPROVEMENT_04 §3.6:
+        1. forced DP compaction → retry
+        2. emergency content-truncate large tool_results → retry
+        3. propagate if still overflowing
 
-        Both are the agent's responsibility. We compress memory and
-        retry once.
-
-        **Why L4 fires unconditionally here**: our local `_estimate_tokens`
-        only counts `render_for_provider()` output — it does NOT count
-        tool schemas (which can run 5-10k+ tokens for a full MCP set)
-        and it does NOT see per-node `context_window` differences.
-        A ContextOverflowError means the router's estimate (which DOES
-        count tools) already said "won't fit", so trusting our local
-        estimate to decide whether to compress causes infinite retry
-        loops on the exact case this method exists to handle.
-        `_full_compress` is itself a no-op when there's nothing to
-        compress (no older rounds), so calling it unconditionally is safe.
+        The router raises ``ContextOverflowError`` either at pre-flight
+        (no healthy node fits the current messages) or at event time
+        (the provider's own 400 ``context_length_exceeded``). Both are
+        the agent's responsibility.
         """
         try:
             return await self.router.call(
@@ -604,32 +837,26 @@ Requirements:
         except ContextOverflowError as exc:
             print(
                 f"\n{Colors.BRIGHT_YELLOW}⚠️  ContextOverflow: {exc}. "
-                f"Compressing memory and retrying...{Colors.RESET}"
+                f"Forcing compaction...{Colors.RESET}"
             )
 
-        # L1: drop placeholder-able tool results from older rounds.
-        self._truncate_old_tool_results(keep_recent_n=3)
-        # L2: shrink older read_file results to path-bearing placeholders.
-        self._truncate_old_readfile_results(keep_recent_n=3)
+        await self._maybe_run_compaction(tool_list, forced=True)
 
-        # L4: always run — see docstring for why the agent's own
-        # estimate cannot be trusted to skip compression here.
-        await self._full_compress(keep_recent_n=3)
-        self._skip_next_token_check = True
+        try:
+            return await self.router.call(
+                messages=self.render_for_provider(), tools=tool_list
+            )
+        except ContextOverflowError as exc2:
+            print(
+                f"\n{Colors.BRIGHT_YELLOW}⚠️  Still overflow: {exc2}. "
+                f"Emergency content truncation...{Colors.RESET}"
+            )
 
-        # Post-L4 safety: the kept rounds may still exceed token_limit on
-        # their own, or the request may be tool-schema-heavy. Tighten the
-        # keep window and, as a last resort, content-truncate large tool
-        # results so the retry has a real chance of fitting.
-        if self._estimate_tokens() > self.token_limit:
-            self._truncate_old_tool_results(keep_recent_n=1)
-            self._truncate_old_readfile_results(keep_recent_n=1)
-            if self._estimate_tokens() > self.token_limit:
-                self._content_truncate_large_tool_results()
+        # Last resort: in-place truncate oversized tool results in the
+        # kept window. This is the only path that still mutates a
+        # message already in live_messages — see IMPROVEMENT_04 §3.3.3.
+        self._content_truncate_large_tool_results()
 
-        # One retry with the compressed messages. If this *also* raises
-        # ContextOverflowError, let it propagate — agent has done
-        # everything it can, the caller sees a real failure.
         return await self.router.call(
             messages=self.render_for_provider(), tools=tool_list
         )
@@ -637,20 +864,6 @@ Requirements:
     # --- Pinned Notes ---
 
     MAX_PINNED_CHARS = 4000
-
-    def _rebuild_system_prompt(self):
-        """Inject pinned notes into system prompt."""
-        if not self.pinned_notes:
-            self.system_prompt = self._base_system_prompt
-            return
-
-        notes_section = "\n\n## Pinned Context (Important - Always Available)\n"
-        for note in self.pinned_notes:
-            cat = note.get("category", "general")
-            content = note.get("content", "")
-            notes_section += f"- [{cat}] {content}\n"
-
-        self.system_prompt = self._base_system_prompt + notes_section
 
     def load_pinned_notes(self, memory_file: str):
         """Load existing pinned notes from JSON file at startup.
@@ -671,14 +884,18 @@ Requirements:
             pass
 
     def _pin_note(self, category: str, content: str):
-        """Add a pinned note, drop oldest if over limit."""
+        """Add a pinned note, drop oldest if over limit.
+
+        Pinned notes used to be baked into ``self.system_prompt`` at
+        write time; in IMPROVEMENT_04 they're rendered into the system
+        blocks at request time by ``_render_system_blocks``, so we no
+        longer keep a duplicate string copy.
+        """
         self.pinned_notes.append({"category": category, "content": content})
-        # Check total length
         total = sum(len(n["content"]) + len(n["category"]) + 10 for n in self.pinned_notes)
         while total > self.MAX_PINNED_CHARS and len(self.pinned_notes) > 1:
             self.pinned_notes.pop(0)
             total = sum(len(n["content"]) + len(n["category"]) + 10 for n in self.pinned_notes)
-        self._rebuild_system_prompt()
 
     async def run(self, cancel_event: Optional[asyncio.Event] = None) -> str:
         """Execute agent loop until task is complete or max steps reached.
@@ -711,8 +928,16 @@ Requirements:
                 return cancel_msg
 
             step_start_time = perf_counter()
-            # Check and compress context to prevent overflow
-            await self._compress_context()
+
+            # IMPROVEMENT_04: tool_list must be defined before
+            # _maybe_run_compaction so the DP snapshot can count tool
+            # schema tokens. The v0 ordering had this assignment after
+            # the compression call.
+            tool_list = list(self.tools.values())
+
+            # DP-driven compaction (replaces v0 three-level compression).
+            # forced=False so the policy can decide NO_OP / net-positive.
+            await self._maybe_run_compaction(tool_list, forced=False)
 
             # Step header with proper width calculation
             BOX_WIDTH = 58
@@ -723,9 +948,6 @@ Requirements:
             print(f"\n{Colors.DIM}╭{'─' * BOX_WIDTH}╮{Colors.RESET}")
             print(f"{Colors.DIM}│{Colors.RESET} {step_text}{' ' * padding}{Colors.DIM}│{Colors.RESET}")
             print(f"{Colors.DIM}╰{'─' * BOX_WIDTH}╯{Colors.RESET}")
-
-            # Get tool list for LLM call
-            tool_list = list(self.tools.values())
 
             # Log LLM request and call LLM with Tool objects directly
             self.logger.log_request(messages=self.render_for_provider(), tools=tool_list)
@@ -744,9 +966,11 @@ Requirements:
                     print(f"\n{Colors.BRIGHT_RED}❌ Error:{Colors.RESET} {error_msg}")
                 return error_msg
 
-            # Accumulate API reported token usage
+            # Accumulate API reported token usage and update DP inputs.
             if response.usage:
                 self.api_total_tokens = response.usage.total_tokens
+                self.last_usage = response.usage
+            self.llm_call_count += 1
 
             # Log LLM response
             self.logger.log_response(

@@ -205,10 +205,6 @@ mini-agent
 mini-agent --workspace /path/to/your/project
 ```
 
-> 📖 For more development guidance, see [Development Guide](docs/DEVELOPMENT_GUIDE.md)
-
-> 📖 For more production deployment guidance, see [Production Guide](docs/PRODUCTION_GUIDE.md)
-
 ## ACP & Zed Editor Integration(optional)
 
 Mini Agent supports the [Agent Communication Protocol (ACP)](https://github.com/modelcontextprotocol/protocol) for integration with code editors like Zed.
@@ -245,19 +241,13 @@ Here are a few examples of what Mini Agent can do.
 
 *In this demo, the agent is asked to create a simple, beautiful webpage and display it in the browser, showcasing the basic tool-use loop.*
 
-![Demo GIF 1: Basic Task Execution](docs/assets/demo1-task-execution.gif "Basic Task Execution Demo")
-
 ### Using a Claude Skill (e.g., PDF Generation)
 
 *Here, the agent leverages a Claude Skill to create a professional document (like a PDF or DOCX) based on the user's request, demonstrating its advanced capabilities.*
 
-![Demo GIF 2: Claude Skill Usage](docs/assets/demo2-claude-skill.gif "Claude Skill Usage Demo")
-
 ### Web Search & Summarization (MCP Tool)
 
 *This demo shows the agent using its web search tool to find up-to-date information online and summarize it for the user.*
-
-![Demo GIF 3: Web Search](docs/assets/demo3-web-search.gif "Web Search Demo")
 
 ## Testing
 
@@ -308,11 +298,6 @@ Make sure you're running from the project directory:
 cd Mini-Agent
 python -m mini_agent.cli
 ```
-
-## Related Documentation
-
-- [Development Guide](docs/DEVELOPMENT_GUIDE.md) - Detailed development and configuration guidance
-- [Production Guide](docs/PRODUCTION_GUIDE.md) - Best practices for production deployment
 
 ## Community
 

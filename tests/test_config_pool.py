@@ -238,18 +238,44 @@ def test_routing_failure_threshold_is_rejected(tmp_path: Path) -> None:
         Config.from_yaml(p)
 
 
-def test_real_config_yaml_loads_with_three_nodes() -> None:
-    """End-to-end: the working config.yaml now exposes a 3-node MiniMax pool."""
-    project_root = Path(__file__).resolve().parent.parent
-    cfg = Config.from_yaml(project_root / "mini_agent" / "config" / "config.yaml")
-    assert len(cfg.llm.pool) == 3
-    node_ids = [n.node_id for n in cfg.llm.pool]
-    assert node_ids == ["minimax-m27", "minimax-m25", "minimax-m21"]
-    # Every node declares its own key — we do NOT rely on inheritance.
-    for node in cfg.llm.pool:
-        assert node.api_key, f"node {node.node_id} missing api_key"
-        assert node.api_base, f"node {node.node_id} missing api_base"
-        assert node.provider == "anthropic"
+def test_deepseek_pool_entry_preserves_cache_flags(tmp_path: Path) -> None:
+    """DeepSeek V4 Pro config keeps the cache capability split intact.
+
+    IMPROVEMENT_04 depends on this exact capability shape: DeepSeek does
+    not use Anthropic explicit cache_control markers, but it does have
+    automatic Context Caching, so the DP policy must keep hit/miss
+    pricing enabled instead of degrading to cache==input.
+    """
+    p = _write_yaml(
+        tmp_path,
+        {
+            "pool": [
+                {
+                    "node_id": "deepseek-v4-pro",
+                    "provider": "anthropic",
+                    "api_key": "sk-deepseek",
+                    "api_base": "https://api.deepseek.com/anthropic",
+                    "model": "deepseek-v4-pro",
+                    "priority": 110,
+                    "context_window": 1_000_000,
+                    "max_output_tokens": 8192,
+                    "supports_explicit_cache_control": False,
+                    "supports_automatic_context_cache": True,
+                }
+            ],
+        },
+    )
+    cfg = Config.from_yaml(p)
+    assert len(cfg.llm.pool) == 1
+    node = cfg.llm.pool[0]
+    assert node.node_id == "deepseek-v4-pro"
+    assert node.provider == "anthropic"
+    assert node.protocol_family == "anthropic"
+    assert node.api_key
+    assert node.api_base == "https://api.deepseek.com/anthropic"
+    assert node.model == "deepseek-v4-pro"
+    assert node.supports_explicit_cache_control is False
+    assert node.supports_automatic_context_cache is True
 
 
 # ----------------------------------------------------------------------

@@ -647,6 +647,8 @@ async def run_agent(
                 supports_tools=entry.supports_tools,
                 supports_thinking=entry.supports_thinking,
                 enabled=entry.enabled,
+                supports_explicit_cache_control=entry.supports_explicit_cache_control,
+                supports_automatic_context_cache=entry.supports_automatic_context_cache,
             )
         )
 
