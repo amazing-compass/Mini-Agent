@@ -105,8 +105,29 @@ class ReadTool(Tool):
             "required": ["path"],
         }
 
-    async def execute(self, path: str, offset: int | None = None, limit: int | None = None) -> ToolResult:
-        """Execute read file."""
+    async def execute(
+        self,
+        path: str | None = None,
+        offset: int | None = None,
+        limit: int | None = None,
+        **kwargs,
+    ) -> ToolResult:
+        """Execute read file.
+
+        Accepts ``file`` / ``filepath`` / ``file_path`` as aliases for
+        ``path`` — DeepSeek (and other models) occasionally emit these
+        despite the schema. ~8% of read_file calls in our SWE-bench
+        runs used the wrong kwarg name; tolerating it saves a wasted
+        round-trip per occurrence.
+        """
+        if path is None:
+            path = kwargs.get("file") or kwargs.get("filepath") or kwargs.get("file_path")
+        if path is None:
+            return ToolResult(
+                success=False,
+                content="",
+                error="`path` is required (also accepts file/filepath/file_path)",
+            )
         try:
             file_path = Path(path)
             # Resolve relative paths relative to workspace_dir

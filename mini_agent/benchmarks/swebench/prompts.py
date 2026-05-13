@@ -59,7 +59,11 @@ clean.
 - Do NOT modify test files unless the problem statement explicitly asks for \
 new/updated tests.
 - Do NOT refactor unrelated code, even if it looks improvable.
-- If you're unsure where the bug is, prefer reading more code over guessing.
+- Cap your exploration: after reading ~5-10 relevant files (or ~20 read_file \
+calls), COMMIT to a best-guess minimal fix and call `edit_file` / `write_file`. \
+Since you cannot run tests in this environment, additional reading does NOT \
+increase confidence — produce the smallest plausible patch and stop. Never \
+return without at least attempting an edit.
 
 ## When you finish
 End your response with a one-sentence summary of the change. The system will \
