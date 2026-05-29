@@ -1,3 +1,4 @@
+# ✅
 """Client factory for the node pool.
 
 Phase 3 consolidates the pieces that used to live inside the deleted
@@ -34,7 +35,7 @@ if TYPE_CHECKING:
 # MiniMax API domains that need automatic protocol-suffix handling.
 MINIMAX_DOMAINS = ("api.minimax.io", "api.minimaxi.com")
 
-
+# URL 归一化 -- 仅内部调用
 def normalize_api_base(api_base: str, provider: str) -> str:
     """Resolve the final API base URL.
 
@@ -61,7 +62,7 @@ def normalize_api_base(api_base: str, provider: str) -> str:
         return f"{stripped}/v1"
     raise ValueError(f"Unsupported provider for MiniMax normalization: {provider!r}")
 
-
+# 把
 def build_client_factory(
     retry_config: RetryConfig | None = None,
 ) -> Callable[[ModelNode], "LLMClientBase"]:

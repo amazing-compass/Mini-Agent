@@ -1,3 +1,4 @@
+# ✅
 """Elegant retry mechanism module
 
 Provides decorators and utility functions to support retry logic for async functions.
@@ -80,13 +81,22 @@ class RetryExhaustedError(Exception):
         self.attempts = attempts
         super().__init__(f"Retry failed after {attempts} attempts. Last error: {str(last_exception)}")
 
-
+# 实现一个异步函数的重试装饰器
 def async_retry(
+    # Callable -- 传入的是函数 -- 而不是函数返回值
+    # Callable[[Exception, int], None] --- 传入的是一个函数，参数是Exception和int，返回值是None
+    # Callable[[Exception], bool] --- 传入的是一个函数，参数是Exception，返回值是bool
     config: RetryConfig | None = None,
-    on_retry: Callable[[Exception, int], None] | None = None,
+    on_retry: Callable[[Exception, int], None] | None = None, 
     should_retry: Callable[[Exception], bool] | None = None,
 ) -> Callable:
+
+    # on_retry: 在每次重试之前调用的回调函数 -- 可以做一些副作用--- 比如记录日志、切换姐弟哪
+
+    # should_retry: 让你决定这个具体的异常 值不值得重试 --  返回false就立刻抛出
+
     """Async function retry decorator.
+    
 
     Args:
         config: Retry configuration object, uses default config if None.
@@ -115,9 +125,15 @@ def async_retry(
     if config is None:
         config = RetryConfig()
 
+    # 接收被装饰的原始函数 -- 返回一个wrapper --- 
     def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+
+        # 注解 -- 把原始函数的元数据复制到wrapper函数上
         @functools.wraps(func)
+        # *args 和 **kwargs  -- 让wrapper能接收任意参数 -- 原封不动传给原函数 -- 相当于透明转发
         async def wrapper(*args: Any, **kwargs: Any) -> Any:
+
+            # 保存最后一次异常 --- 在循环结束后，如果需要抛出异常，能知道最后一次是什么错误
             last_exception: Exception | None = None
 
             for attempt in range(config.max_retries + 1):
@@ -125,7 +141,7 @@ def async_retry(
                     # Try to execute function
                     return await func(*args, **kwargs)
 
-                except config.retryable_exceptions as e:
+                except config.retryable_exceptions as e:  # 如果遇到可重试的异常 -- 进入重试逻辑
                     last_exception = e
 
                     # Classification gate: let callers veto retries for

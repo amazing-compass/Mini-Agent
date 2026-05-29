@@ -1,3 +1,4 @@
+# ✅
 """Passive health tracking + 3-state circuit breaker for model nodes.
 
 Phase 2 extends the Phase 1 minimal NodeHealth (consecutive failures +
@@ -46,35 +47,35 @@ class NodeHealth:
 
     def __init__(
         self,
-        node_id: str,
-        failure_threshold: int = 3,
-        cooldown_seconds: float = 60.0,
+        node_id: str,    # 字节唯一标识
+        failure_threshold: int = 3,   # 连续失败几次触发熔断
+        cooldown_seconds: float = 60.0,   # OPEN状态冷却时长
     ) -> None:
         self.node_id = node_id
         self._failure_threshold = max(1, failure_threshold)
         self._cooldown_seconds = max(0.0, cooldown_seconds)
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()    # 线程锁 -- 所有读写操作都加锁
 
-        self.consecutive_failures = 0
-        self.consecutive_successes = 0
-        self.total_failures = 0
-        self.total_successes = 0
-        self.last_failure_at: float | None = None
-        self.last_success_at: float | None = None
-        self.last_error_category: ErrorCategory | None = None
-        self.last_error_message: str | None = None
+        self.consecutive_failures = 0    # 连续失败次数
+        self.consecutive_successes = 0    # 连续成功次数
+        self.total_failures = 0    # 生命周期累计值，用于长期监控
+        self.total_successes = 0    # 生命周期累计值，用于长期监控
+        self.last_failure_at: float | None = None    # 最后一次失败的时间戳
+        self.last_success_at: float | None = None    # 最后一次成功的时间戳
+        self.last_error_category: ErrorCategory | None = None    # 最后一次失败的分类
+        self.last_error_message: str | None = None    # 最后一次失败的错误消息
 
         # Phase 2: circuit state machine
-        self.circuit_state: str = CLOSED
-        self.cooldown_until: float | None = None
+        self.circuit_state: str = CLOSED     # 当前熔断器状态 -- 三种：CLOSED, OPEN, HALF_OPEN
+        self.cooldown_until: float | None = None    # OPEN状态下的冷却截止时间戳
         # Exclusivity flag: set True by `on_attempt` when the state is
         # pushed into HALF_OPEN so concurrent callers (most notably ACP
         # cross-session traffic) don't flood a still-broken node during
         # its probe window. Cleared by record_success / record_failure.
-        self._probe_in_flight: bool = False
+        self._probe_in_flight: bool = False    # 是否正在探测 -- 如果正在探测，则返回False -- 因为探测时不能通过
 
     # ---- reads (no side effects) ----
-
+    # 路由层用 -- 断路器是否允许本次请求通过
     def is_passable(self) -> bool:
         """Closed / half-open / open-with-cooldown-elapsed → True.
 
@@ -92,6 +93,7 @@ class NodeHealth:
             # the probe slot.
             return self.cooldown_until is not None and time.time() >= self.cooldown_until
 
+    # 内部调用（如摘要统计）专用的严格版 -- 只有CLOSE或HALF_OPEN状态才能通过
     def is_serving(self) -> bool:
         """Strict: closed / half-open (no probe in flight). Used by internal_call.
 
@@ -106,8 +108,8 @@ class NodeHealth:
             return False
 
     # ---- writes (state transitions) ----
-
-    def on_attempt(self) -> None:
+    # 真正发出探针请求前调用 -- 将OPEN -> HALF_OPEN 并锁定探针槽
+    def on_attempt(self) -> None:    # 业务主循环用 -- 在即将发出真实探测请求时，将状态从OPEN+冷却结束 → HALF_OPEN
         """Transition open+cooldown-elapsed → half-open exactly when the
         business main loop is about to issue a real probe request. No-op
         in other states.
@@ -126,6 +128,7 @@ class NodeHealth:
                 self.circuit_state = HALF_OPEN
                 self._probe_in_flight = True
 
+    # 记录一次成功
     def record_success(self) -> None:
         with self._lock:
             # A success means the node is working — clear any residual
@@ -144,6 +147,7 @@ class NodeHealth:
             self.last_error_message = None
             self._probe_in_flight = False  # probe (if any) completed
 
+    # 记录一次失败
     def record_failure(self, category: ErrorCategory, exc: Exception) -> None:
         with self._lock:
             self.consecutive_failures += 1
@@ -174,6 +178,7 @@ class NodeHealth:
         """
         return self.is_passable()
 
+    # 在锁保护下拍一份只读的健康状态快照
     def snapshot(self) -> NodeHealthSnapshot:
         with self._lock:
             return NodeHealthSnapshot(
@@ -207,9 +212,9 @@ class SimpleBreaker:
         failure_threshold: int = 3,
         cooldown_seconds: float = 60.0,
     ) -> None:
-        self._failure_threshold = failure_threshold
-        self._cooldown_seconds = cooldown_seconds
-        self._healths: dict[str, NodeHealth] = {}
+        self._failure_threshold = failure_threshold  # 连续失败几次触发熔断
+        self._cooldown_seconds = cooldown_seconds     # 冷却时长，透传给每个 NodeHealth
+        self._healths: dict[str, NodeHealth] = {}   # 核心：node_id → NodeHealth 的映射
         self._lock = threading.Lock()
 
     def get(self, node_id: str) -> NodeHealth:

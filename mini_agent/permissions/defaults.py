@@ -1,3 +1,4 @@
+# ✅
 """Default tool taxonomy and baseline permission rules.
 
 The three tool groups drive the mode-aware branch in :class:`PermissionManager`.

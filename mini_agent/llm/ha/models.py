@@ -1,3 +1,4 @@
+# ✅
 """Data models for the HA layer (model nodes, health snapshots, routing decisions)."""
 
 from pydantic import BaseModel, Field
@@ -39,24 +40,24 @@ class NodeHealthSnapshot(BaseModel):
     """Immutable snapshot of a node's health state, safe to log or return."""
 
     node_id: str
-    consecutive_failures: int = 0
-    consecutive_successes: int = 0
-    total_failures: int = 0
-    total_successes: int = 0
-    last_failure_at: float | None = None  # unix timestamp (seconds)
+    consecutive_failures: int = 0   # 连续失败次数，达到阈值时熔断器打开
+    consecutive_successes: int = 0  # 连续成功次数
+    total_failures: int = 0      #生命周期累计值，用于长期监控
+    total_successes: int = 0     
+    last_failure_at: float | None = None  # Unix 时间戳，方便计算距上次失败多久
     last_success_at: float | None = None
-    last_error_category: str | None = None
+    last_error_category: str | None = None   # 最后一次失败的分类和消息，调试用
     last_error_message: str | None = None
     is_healthy: bool = True
     # Phase 2 circuit-breaker fields (closed / open / half-open).
-    circuit_state: str = "closed"
-    cooldown_until: float | None = None
+    circuit_state: str = "closed"        # 三态
+    cooldown_until: float | None = None   # OPEN 状态下的冷却截止时间戳，过了这个时间才允许探测
 
 
 class RoutingDecision(BaseModel):
     """Explains why a given node was selected (or why all candidates failed)."""
 
-    selected_node_id: str | None
-    candidate_node_ids: list[str] = Field(default_factory=list)
-    fallback_level: int = 0
-    reason: str = ""
+    selected_node_id: str | None     # 最终成功的节点 ID
+    candidate_node_ids: list[str] = Field(default_factory=list)   # 本次参与竞选的所有节点 ID 列表
+    fallback_level: int = 0     # 0 = 第一优先级节点直接成功；1 = failover 到第二个，以此类推
+    reason: str = ""    # 人类可读的说明，如 "success on primary node 'minimax-primary'"

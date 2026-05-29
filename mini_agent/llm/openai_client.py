@@ -1,3 +1,4 @@
+# ✅
 """OpenAI LLM client implementation."""
 
 import json
@@ -95,6 +96,7 @@ class OpenAIClient(LLMClientBase):
         except Exception as exc:
             raise normalize_sdk_error(exc) from exc
 
+# ✅
     def _convert_tools(self, tools: list[Any]) -> list[dict[str, Any]]:
         """Convert tools to OpenAI format.
 

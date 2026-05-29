@@ -1,3 +1,4 @@
+# ✅
 """Data classes used by the cache-aware compaction policy.
 
 These types are pure data containers: no I/O, no LLM access, no side

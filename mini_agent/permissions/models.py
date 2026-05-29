@@ -1,3 +1,4 @@
+# ✅
 """Permission data models.
 
 Keep these intentionally small: they describe *what* the decision is, not

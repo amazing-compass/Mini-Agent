@@ -17,6 +17,7 @@ from dataclasses import dataclass
 
 Severity = str  # "severe" | "warning"
 
+# (规则名, 正则字符串, 严重级别)
 # Each entry: (name, compiled pattern, severity)
 _VALIDATOR_SPECS: list[tuple[str, str, Severity]] = [
     # `sudo` is basically never safe in an agent sandbox.

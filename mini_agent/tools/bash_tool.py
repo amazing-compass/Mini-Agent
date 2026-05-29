@@ -1,3 +1,4 @@
+# ✅
 """Shell command execution tool with background process management.
 
 Supports both bash (Unix/Linux/macOS) and PowerShell (Windows).
@@ -24,6 +25,8 @@ class BashOutputResult(ToolResult):
     - error: str | None (used for error messages)
     """
 
+    # stdout stderr --- shell 命令本来就有 stdout / stderr 两条独立的输出流
+    # 这里用的 str --- 但实际上操作系统输出的是 bytes --- 之后会在工具里 decode 成 str
     stdout: str = Field(description="The command's standard output")
     stderr: str = Field(description="The command's standard error output")
     exit_code: int = Field(description="The command's exit code")
@@ -49,6 +52,8 @@ class BashOutputResult(ToolResult):
         return self
 
 
+
+# 后台进程的档案卡
 class BackgroundShell:
     """Background shell data container.
 
@@ -56,20 +61,28 @@ class BackgroundShell:
     IO operations are managed externally by BackgroundShellManager.
     """
 
+    # process: asyncio.subprocess.Process --- 真正的 OS 子进程句柄
     def __init__(self, bash_id: str, command: str, process: "asyncio.subprocess.Process", start_time: float):
+
         self.bash_id = bash_id
         self.command = command
+        # 真正的 OS 子进程句柄
         self.process = process
         self.start_time = start_time
-        self.output_lines: list[str] = []
-        self.last_read_index = 0
+
+        # 状态/缓存 ---- 
+        self.output_lines: list[str] = []    # 所有输出按行存储
+        self.last_read_index = 0       # 增量读索引
         self.status = "running"
         self.exit_code: int | None = None
 
+    # 被 BackgroundShellManager 的监控任务调用，持续往 output_lines 里添加新输出
     def add_output(self, line: str):
         """Add new output line."""
         self.output_lines.append(line)
 
+    # 被 BashOutputTool 调用，获取自上次检查以来的新输出
+    # filter_pattern 根据正则规则过滤输出行  ⚠️ 不可逆 
     def get_new_output(self, filter_pattern: str | None = None) -> list[str]:
         """Get new output since last check, optionally filtered by regex."""
         new_lines = self.output_lines[self.last_read_index :]
@@ -85,19 +98,30 @@ class BackgroundShell:
 
         return new_lines
 
+    # 被 BackgroundShellManager 的监控任务调用，根据子进程状态更新自己的状态
     def update_status(self, is_alive: bool, exit_code: int | None = None):
         """Update process status."""
         if not is_alive:
             self.status = "completed" if exit_code == 0 else "failed"
             self.exit_code = exit_code
+        #  实际死代码
         else:
             self.status = "running"
 
     async def terminate(self):
         """Terminate the background process."""
         if self.process.returncode is None:
+            # 同步方法 --- 发一个信号给 OS 立刻返回 不等进程真的退出
             self.process.terminate()
             try:
+                # self.process.wait()   wait() 
+                # self.process.wait() 和  asyncio.wait_for 都是协程方法
+                # 协程函数 -- 一种可以中途暂停、 之后再恢复的函数 --- 就是 async def 定义的函数
+                # async def f()
+                # f() --- 只是生成一个协程对象 -- 不执行
+                # await f() --- 才真正执行这个协程函数  
+                # wait() --- 等待 process 退出 --- 但是如果 process 不退出 --- 就会一直等下去 --- 可能导致死锁
+                # wait_for() --- 给里面的协程函数设置一个超时时间
                 await asyncio.wait_for(self.process.wait(), timeout=5)
             except asyncio.TimeoutError:
                 self.process.kill()
@@ -105,10 +129,15 @@ class BackgroundShell:
         self.exit_code = self.process.returncode
 
 
+# ✅
 class BackgroundShellManager:
     """Manager for all background shell processes."""
 
+    # _开头表示 保护/内部使用
     _shells: dict[str, BackgroundShell] = {}
+
+    # Task --- asyncio模块中的类 --- 表示一个正在事件循环里跑的协程
+    # 
     _monitor_tasks: dict[str, asyncio.Task] = {}
 
     @classmethod
@@ -175,7 +204,13 @@ class BackgroundShellManager:
                 if bash_id in cls._monitor_tasks:
                     del cls._monitor_tasks[bash_id]
 
-        task = asyncio.create_task(monitor())
+        # monitor() -- 本身只会得到一个 coroutine 对象 -- 本身什么都不做 -- 必须await才执行
+        # asyncio.create_task(coro) --- 把这个协程提交给事件循环 -- 让它成为一个 Task -- 然后立刻在后台开始调度执行
+        # Task 本质对coroutine的包装 --- 
+        # task.cancel()
+        # task.done() --- 判断这个任务是否已经完成（无论成功、失败还是被取消）
+        # 
+        task = asyncio.create_task(monitor()) 
         cls._monitor_tasks[bash_id] = task
 
     @classmethod
@@ -213,7 +248,7 @@ class BackgroundShellManager:
 
         return shell
 
-
+# ✅
 class BashTool(Tool):
     """Execute shell commands in foreground or background.
 
@@ -230,6 +265,7 @@ class BashTool(Tool):
                            If provided, all commands run in this directory.
                            If None, commands run in the process's cwd.
         """
+        # is_windows: bool --- 当前操作系统是否是 Windows
         self.is_windows = platform.system() == "Windows"
         self.shell_name = "PowerShell" if self.is_windows else "bash"
         self.workspace_dir = workspace_dir
@@ -340,6 +376,7 @@ Examples:
 
             if run_in_background:
                 # Background execution: Create isolated process
+                # 取UUID的前 8 位作为 bash_id
                 bash_id = str(uuid.uuid4())[:8]
 
                 # Start background process with combined stdout/stderr
@@ -388,6 +425,7 @@ Examples:
                         cwd=self.workspace_dir,
                     )
                 else:
+                    # create_subprocess_shell  subprocess -- 子进程   shell -- 通过 shell 启动
                     process = await asyncio.create_subprocess_shell(
                         shell_cmd,
                         stdout=asyncio.subprocess.PIPE,
@@ -396,6 +434,7 @@ Examples:
                     )
 
                 try:
+                    # communicate() --- 会等待子进程全部跑完 --- 获得输出
                     stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
                 except asyncio.TimeoutError:
                     process.kill()
@@ -408,6 +447,8 @@ Examples:
                         exit_code=-1,
                     )
 
+                # 操作系统给进程输出的本质是 bytes
+                # 所以这里的转成str
                 # Decode output
                 stdout_text = stdout.decode("utf-8", errors="replace")
                 stderr_text = stderr.decode("utf-8", errors="replace")
@@ -437,7 +478,7 @@ Examples:
                 exit_code=-1,
             )
 
-
+# ✅
 class BashOutputTool(Tool):
     """Retrieve output from background bash shells."""
 

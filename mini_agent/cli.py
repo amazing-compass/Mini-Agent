@@ -50,7 +50,7 @@ from mini_agent.tools.note_tool import SessionNoteTool
 from mini_agent.tools.skill_tool import create_skill_tools
 from mini_agent.utils import calculate_display_width
 
-
+# ✅
 # ANSI color codes
 class Colors:
     """Terminal color definitions"""
@@ -85,12 +85,12 @@ class Colors:
     BG_YELLOW = "\033[43m"
     BG_BLUE = "\033[44m"
 
-
+# ✅
 def get_log_directory() -> Path:
     """Get the log directory path."""
     return Path.home() / ".mini-agent" / "log"
 
-
+# ✅
 def show_log_directory(open_file_manager: bool = True) -> None:
     """Show log directory contents and optionally open file manager.
 
@@ -117,6 +117,7 @@ def show_log_directory(open_file_manager: bool = True) -> None:
     print(f"{Colors.DIM}{'─' * 60}{Colors.RESET}")
     print(f"{Colors.BOLD}{Colors.BRIGHT_YELLOW}Available Log Files (newest first):{Colors.RESET}")
 
+    # 只显示 前 10 个文件，避免过长列表淹没重要信息
     for i, log_file in enumerate(log_files[:10], 1):
         mtime = datetime.fromtimestamp(log_file.stat().st_mtime)
         size = log_file.stat().st_size
@@ -135,7 +136,7 @@ def show_log_directory(open_file_manager: bool = True) -> None:
 
     print()
 
-
+# ✅
 def _open_directory_in_file_manager(directory: Path) -> None:
     """Open directory in system file manager (cross-platform)."""
     system = platform.system()
@@ -152,7 +153,7 @@ def _open_directory_in_file_manager(directory: Path) -> None:
     except Exception as e:
         print(f"{Colors.YELLOW}Error opening file manager: {e}{Colors.RESET}")
 
-
+# ✅
 def read_log_file(filename: str) -> None:
     """Read and display a specific log file.
 
@@ -178,6 +179,7 @@ def read_log_file(filename: str) -> None:
     except Exception as e:
         print(f"\n{Colors.RED}❌ Error reading file: {e}{Colors.RESET}\n")
 
+# ⬆️ 上面都是涉及log -- 不用看
 
 def print_banner():
     """Print welcome banner with proper alignment"""
@@ -297,6 +299,8 @@ def print_stats(agent: Agent, session_start: datetime):
     print(f"{Colors.DIM}{'─' * 40}{Colors.RESET}\n")
 
 
+# ✅
+# python 标准库 argparse
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments
 
@@ -314,6 +318,8 @@ Examples:
   mini-agent log agent_run_xxx.log        # Read a specific log file
         """,
     )
+
+    # workspace 后面传入 resolve_workspace_dir()
     parser.add_argument(
         "--workspace",
         "-w",
@@ -328,6 +334,9 @@ Examples:
         default=None,
         help="Execute a task non-interactively and exit",
     )
+    # mode --- 权限模式开关
+    # default + plan + auto 三种模式
+    # 后续可以通过 /model 在 REPL 中切换
     parser.add_argument(
         "--mode",
         "-m",
@@ -340,6 +349,10 @@ Examples:
             "'auto' auto-allows read/session-meta tools"
         ),
     )
+
+    # action --- 决定 argparse 在解析这个参数后采取的动作
+    # 默认是 store --- 就是存储对应值
+    # store_true -- 命中即存 true
     parser.add_argument(
         "--yes",
         "-y",
@@ -351,6 +364,8 @@ Examples:
             "deny rules are still absolute and override --yes."
         ),
     )
+
+    # version -- 打印版本并 sys.exit(0)
     parser.add_argument(
         "--version",
         "-v",
@@ -359,6 +374,7 @@ Examples:
     )
 
     # Subcommands
+    # subparser 子命令  -- 给主 parser 挂一棵「子 parser 树」
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
     # log subcommand
@@ -369,10 +385,11 @@ Examples:
         default=None,
         help="Log filename to read (optional, shows directory if omitted)",
     )
-
+    # 返回 argparse.Namespace 对象
+    # 本质是一个简单属性容器类 ---  取参数用 args.task 这样
     return parser.parse_args()
 
-
+# ✅
 async def initialize_base_tools(config: Config):
     """Initialize base tools (independent of workspace)
 
@@ -468,7 +485,7 @@ async def initialize_base_tools(config: Config):
     print()  # Empty line separator
     return tools, skill_loader
 
-
+# ✅
 def add_workspace_tools(tools: List[Tool], config: Config, workspace_dir: Path):
     """Add workspace-dependent tools
 
@@ -520,7 +537,7 @@ async def _quiet_cleanup():
     except Exception:
         pass
 
-
+# ✅
 async def _auto_yes_approval(
     tool_name: str,
     arguments: dict,
@@ -541,6 +558,7 @@ async def _auto_yes_approval(
     return True
 
 
+# yes --- 自动批准所有需要询问的工具调用
 async def run_agent(
     workspace_dir: Path,
     task: str = None,
@@ -1152,7 +1170,11 @@ async def run_agent(
     # 11. Cleanup MCP connections
     await _quiet_cleanup()
 
-
+# ✅
+# 1. CLI argument parsing
+# 2. Config 注入
+# 3. Pwd() 
+# * 后面全部强制用关键字传参数
 def resolve_workspace_dir(
     cli_workspace: str | None,
     *,
@@ -1186,6 +1208,7 @@ def resolve_workspace_dir(
     return Path.cwd()
 
 
+# ✅
 def main():
     """Main entry point for CLI"""
     # Parse command line arguments
@@ -1214,6 +1237,6 @@ def main():
         )
     )
 
-
+# ✅
 if __name__ == "__main__":
     main()

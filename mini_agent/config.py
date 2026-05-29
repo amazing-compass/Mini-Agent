@@ -1,3 +1,4 @@
+# ✅ Conifg类完全结束
 """Configuration management module
 
 Provides unified configuration loading and management functionality.
@@ -33,9 +34,15 @@ Pool (nested under `llm:` or mixed with top level):
 
 import os
 from pathlib import Path
+
+# Any 任意类型
 from typing import Any
 
 import yaml
+
+#  pydantic 用于数据验证和设置管理  
+# 继承 BaseModel -- 自动获得类型校验、类型转换、默认值处理等功能
+# Field 用于定义字段的默认值和元数据
 from pydantic import BaseModel, Field
 
 
@@ -98,7 +105,8 @@ class ModelNodeConfig(BaseModel):
     supports_explicit_cache_control: bool = False
     supports_automatic_context_cache: bool = False
 
-
+# Field 是 Pydantic 给字段附加「元信息」的工具
+# default_factory= 工厂函数 --- 每次构造新实例时调一次产生默认值
 class LLMConfig(BaseModel):
     """LLM configuration — Phase 3 is pool-only.
 
@@ -270,6 +278,7 @@ class Config(BaseModel):
     agent: AgentConfig
     tools: ToolsConfig
 
+    # 类方法 --- 只能访问类数据 -- 所以参数中带有 cls
     @classmethod
     def load(cls) -> "Config":
         """Load configuration from the default search path."""
@@ -278,6 +287,7 @@ class Config(BaseModel):
             raise FileNotFoundError("Configuration file not found. Run scripts/setup-config.sh or place config.yaml in mini_agent/config/.")
         return cls.from_yaml(config_path)
 
+    # “Config“ --- forward reference --- 在类定义体内引用 Config 需要用字符串引起来
     @classmethod
     def from_yaml(cls, config_path: str | Path) -> "Config":
         """Load configuration from YAML file.
@@ -298,6 +308,7 @@ class Config(BaseModel):
         if not data:
             raise ValueError("Configuration file is empty")
 
+        # 当前config配置直接走空
         llm_section: dict[str, Any] = data.get("llm") if isinstance(data.get("llm"), dict) else {}
 
         # Reject legacy flat fields loudly. Design §13.7 step 8 retires
@@ -394,6 +405,7 @@ class Config(BaseModel):
             tools=tools_config,
         )
 
+    # 静态方法 --- 纯工具函数 --- 什么都访问不了 --- 所以参数中什么都没有
     @staticmethod
     def get_package_dir() -> Path:
         """Get the package installation directory
@@ -402,6 +414,7 @@ class Config(BaseModel):
             Path to the mini_agent package directory
         """
         # Get the directory where this config.py file is located
+        #__file__ python 内置模块级变量 --- 表示当前这个.py文件的路径
         return Path(__file__).parent
 
     @classmethod

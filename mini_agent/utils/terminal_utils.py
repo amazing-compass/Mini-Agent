@@ -1,3 +1,4 @@
+# ✅
 """Terminal display utilities for proper text alignment.
 
 This module provides utilities for calculating visible width of text in terminals,
@@ -15,6 +16,8 @@ EMOJI_START = 0x1F300
 EMOJI_END = 0x1FAFF
 
 
+# ✅
+# 算一段文本在终端实际占多少列 -- 剥掉 ANSI 颜色码、emoji 算 2 列、CJK 全角字算 2 列、组合字符算 0 列
 def calculate_display_width(text: str) -> int:
     """Calculate the visible width of text in terminal columns.
 
@@ -68,6 +71,8 @@ def calculate_display_width(text: str) -> int:
     return width
 
 
+# ✅
+# 把文本截断到 max_width 列以内 -- 超长才加省略号 "…", 用 calculate_display_width 保证 CJK 不会算错
 def truncate_with_ellipsis(text: str, max_width: int, ellipsis: str = "…") -> str:
     """Truncate text to fit within max_width, adding ellipsis if needed.
 
@@ -117,6 +122,8 @@ def truncate_with_ellipsis(text: str, max_width: int, ellipsis: str = "…") -> 
     return truncated + ellipsis
 
 
+# ✅
+# 把文本补齐到 target_width 列 -- 支持 left/right/center 三种对齐方式, 不够长才补, 超长不动
 def pad_to_width(text: str, target_width: int, align: str = "left", fill_char: str = " ") -> str:
     """Pad text to reach target width with proper alignment.
 

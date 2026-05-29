@@ -1,3 +1,4 @@
+# Base Tool 基类 ✅
 """Base tool classes."""
 
 from typing import Any
@@ -16,6 +17,7 @@ class ToolResult(BaseModel):
 class Tool:
     """Base class for all tools."""
 
+    # property 属性装饰器 用于将一个方法转换为属性
     @property
     def name(self) -> str:
         """Tool name."""

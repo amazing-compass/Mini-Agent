@@ -1,3 +1,4 @@
+# ✅
 """Data models for the session planner."""
 
 from __future__ import annotations

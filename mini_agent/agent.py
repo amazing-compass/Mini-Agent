@@ -1,3 +1,4 @@
+# ✅
 """Core Agent implementation."""
 
 import asyncio
@@ -26,6 +27,10 @@ from .utils import calculate_display_width
 # Type alias: approval callback signature.
 # Returns True to allow, False to deny. Reason is the PermissionDecision reason
 # so the CLI can display context ("why is this being asked?").
+
+# 给Callablep[参数, 返回值] 起别名 ApprovalCallback
+# Callable[[str, dict, str], Awaitable[bool]] 表示一个函数类型约束
+# 凡是接受(str, dict, str) 这三个参数的函数 -- 返回Awaitable[bool] 的函数 -- 都叫ApprovalCallback
 ApprovalCallback = Callable[[str, dict, str], Awaitable[bool]]
 
 
@@ -59,6 +64,8 @@ class Colors:
 class Agent:
     """Single agent with basic tools and MCP support."""
 
+    # ✅
+    # 初始化agent -- 接收 router、system_prompt、tools、权限管理器等，构建内部状态
     def __init__(
         self,
         router: ModelRouter,
@@ -149,11 +156,16 @@ class Agent:
 
     # --- Backward-compatible messages property ---
 
+    # ✅
+    # 兼容旧接口，读取时等价于 render_for_provider()，写入时支持 /clear 重置会话
     @property
     def messages(self) -> list[Message]:
         """Backward compatible: return full message list view (read-only)."""
         return self.render_for_provider()
 
+    # ✅
+    # 没命中if -- 实际上是兜底
+    # 这部分代码只有/clear执行
     @messages.setter
     def messages(self, value: list[Message]):
         """Backward compatible: support agent.messages = [agent.messages[0]] for /clear."""
@@ -172,7 +184,7 @@ class Agent:
         self.live_messages = [m for m in value if m.role != "system"]
 
     # --- Render for provider ---
-
+    # ✅
     def _render_system_blocks(self) -> list[dict]:
         """Build Anthropic-shape system blocks ordered by change frequency.
 
@@ -223,6 +235,8 @@ class Agent:
 
         return blocks
 
+    # ✅
+    # 组装完整消息列表，把 system blocks + live_messages 合并成 API 可接受的格式
     def render_for_provider(self) -> list[Message]:
         """Assemble internal storage into an API-legal message sequence.
 
@@ -248,11 +262,14 @@ class Agent:
     # can triple; this is a known trade-off.
     MAX_TOOL_RESULT_CHARS = 50_000
 
+    # ✅
+    # 添加用户消息到历史，同时递增 user_turn_count
     def add_user_message(self, content: str):
         """Add a user message to history."""
         self.live_messages.append(Message(role="user", content=content))
         self.user_turn_count += 1
 
+    # ✅
     def _add_assistant_message(self, response) -> Message:
         """Add an assistant message from LLM response."""
         msg = Message(
@@ -264,6 +281,7 @@ class Agent:
         self.live_messages.append(msg)
         return msg
 
+    # ✅
     def _add_tool_message(self, tool_call_id: str, function_name: str, result: ToolResult) -> Message:
         """Add a tool result message, truncating oversized payloads at ingest.
 
@@ -297,6 +315,7 @@ class Agent:
         self.live_messages.append(msg)
         return msg
 
+    # ✅
     def _check_cancelled(self) -> bool:
         """Check if agent execution has been cancelled.
 
@@ -307,11 +326,12 @@ class Agent:
             return True
         return False
 
+    # ✅ 清理未完成的 assistant 消息和其部分工具结果
     def _cleanup_incomplete_messages(self):
         """Remove the incomplete assistant message and its partial tool results.
 
         This ensures message consistency after cancellation by removing
-        only the current step's incomplete messages, preserving completed steps.
+        only he current step's incomplete messages, preserving completed steps.
         """
         # Find the index of the last assistant message
         last_assistant_idx = -1
@@ -330,6 +350,7 @@ class Agent:
             self.live_messages = self.live_messages[:last_assistant_idx]
             print(f"{Colors.DIM}   Cleaned up {removed_count} incomplete message(s){Colors.RESET}")
 
+    # ✅把当前发给LLM 的所有消息进行token计数
     def _estimate_tokens(self) -> int:
         """Accurately calculate token count for message history using tiktoken
 
@@ -367,6 +388,7 @@ class Agent:
 
         return total_tokens
 
+    # ✅
     def _estimate_tokens_fallback(self) -> int:
         """Fallback token estimation method (when tiktoken is unavailable)"""
         total_chars = 0
@@ -415,9 +437,9 @@ class Agent:
         "- English only\n"
         "- If no prior summary exists, produce a fresh summary covering only the conversation above"
     )
-
+    # ✅
     CONTENT_TRUNCATE_KEEP_CHARS = 2000
-
+    # ✅
     def _content_truncate_large_tool_results(self):
         """Emergency-only: truncate the *content* of oversized tool messages.
 
@@ -444,6 +466,7 @@ class Agent:
                 f"{Colors.BRIGHT_YELLOW}🔄 Emergency: content-truncated {count} oversized tool result(s){Colors.RESET}"
             )
 
+    # ✅
     def _parse_section(self, text: str, section_name: str) -> list[str]:
         """Pull bullet items out of a ``## Section Name`` block."""
         lines = text.split("\n")
@@ -470,6 +493,7 @@ class Agent:
         parts.append(summary_text)
         return "\n\n".join(parts)
 
+    # ✅
     @staticmethod
     def _merge_user_goals_preserving_order(
         prior: list[str],
@@ -492,6 +516,7 @@ class Agent:
                 merged.append(goal)
         return merged
 
+    # ✅
     def _parse_structured_summary(
         self,
         summary_text: str,
@@ -525,6 +550,7 @@ class Agent:
             raw_text=self._render_summary_text(merged_user_goals, summary_text),
         )
 
+    # ✅
     def _count_value_tokens(self, value: object) -> int:
         """Best-effort token count for a single string/dict/list value."""
         if value is None:
@@ -546,6 +572,7 @@ class Agent:
             text = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
         return len(enc.encode(text))
 
+    # ✅
     def _count_system_tokens(self) -> int:
         """Token count of base + pinned + current_summary (NOT plan).
 
@@ -561,6 +588,7 @@ class Agent:
             pieces.append(self.current_summary.raw_text)
         return sum(self._count_value_tokens(piece) + 4 for piece in pieces)
 
+    # ✅
     def _count_tools_tokens(self, tool_list: list) -> int:
         """Token count for the tools schema array."""
         schemas: list[object] = []
@@ -575,6 +603,7 @@ class Agent:
                 schemas.append(str(tool))
         return self._count_value_tokens(schemas)
 
+    # ✅
     def _extract_file_paths_from_tool_args(
         self,
         messages: list[Message],
@@ -595,6 +624,7 @@ class Agent:
                         paths.add(value)
         return paths
 
+    # ✅
     def _build_deterministic_fallback_summary(
         self,
         dropped: list[Message],
@@ -655,6 +685,7 @@ class Agent:
             raw_text=raw_text,
         )
 
+    # 把要丢弃的旧消息喂给LLM--归纳成一个ContextSummary
     async def _run_cache_aligned_summary(
         self,
         dropped: list[Message],
@@ -692,6 +723,7 @@ class Agent:
         ]
 
         tool_list = list(self.tools.values())
+        # internal_call -- 
         response = await self.router.internal_call(summary_messages, tools=tool_list)
         return self._parse_structured_summary(
             response.content,
@@ -699,6 +731,7 @@ class Agent:
             prior_user_goals=prior_user_goals,
         )
 
+    # ✅
     def _build_compaction_snapshot(self, tool_list: list) -> CompactionSnapshot:
         """Read-only snapshot of agent state for the DP policy.
 
@@ -737,6 +770,7 @@ class Agent:
             max_context=self.token_limit,
         )
 
+    # ✅
     async def _maybe_run_compaction(
         self,
         tool_list: list,
@@ -765,6 +799,7 @@ class Agent:
         )
 
         try:
+            # 把"要丢弃的旧消息"喂给 LLM，让它归纳成一个 ContextSummary -- 问题是prior_user_goals怎么处理 需要仔细看看源码
             summary = await self._run_cache_aligned_summary(
                 dropped,
                 prior_user_goals=prior_user_goals,
@@ -801,6 +836,8 @@ class Agent:
 
     # ---- Router interop: ContextOverflowError recovery ----
 
+    # ✅
+    # 对外的 LLM 调用入口，内含 ContextOverflow 三阶段恢复逻辑，外部调用方应走这里而非直接调 router
     async def safe_generate(self, tool_list: list) -> Any:
         """Public entry point: call the LLM with ContextOverflow recovery.
 
@@ -817,6 +854,7 @@ class Agent:
         """
         return await self._generate_with_overflow_recovery(tool_list)
 
+    # ✅
     async def _generate_with_overflow_recovery(self, tool_list: list) -> Any:
         """Call the LLM, recovering from ContextOverflowError via forced compaction.
 
@@ -865,6 +903,8 @@ class Agent:
 
     MAX_PINNED_CHARS = 4000
 
+    # ✅
+    # 从文件加载持久化便签 -- agent 启动时调用 -- 跨会话保留重要上下文
     def load_pinned_notes(self, memory_file: str):
         """Load existing pinned notes from JSON file at startup.
 
@@ -883,6 +923,7 @@ class Agent:
         except Exception:
             pass
 
+    # ✅
     def _pin_note(self, category: str, content: str):
         """Add a pinned note, drop oldest if over limit.
 
@@ -897,6 +938,8 @@ class Agent:
             self.pinned_notes.pop(0)
             total = sum(len(n["content"]) + len(n["category"]) + 10 for n in self.pinned_notes)
 
+    # ✅
+    # 	agent 主循环，驱动"调用 LLM → 执行工具 → 循环"直到任务完成或到达 max_steps
     async def run(self, cancel_event: Optional[asyncio.Event] = None) -> str:
         """Execute agent loop until task is complete or max steps reached.
 
@@ -917,6 +960,7 @@ class Agent:
         print(f"{Colors.DIM}📝 Log file: {self.logger.get_log_file_path()}{Colors.RESET}")
 
         step = 0
+        # perf_counter() python标准库time模块的高精度计时器
         run_start_time = perf_counter()
 
         while step < self.max_steps:
@@ -1054,6 +1098,8 @@ class Agent:
 
                 # Permission gate (only for known tools).
                 if result is None and self.permission_manager is not None:
+                    # check() --- 返回一个PermissionDecision 对象
+                    # behavior: allow, deny, ask
                     permission_decision = self.permission_manager.check(
                         function_name, arguments
                     )
@@ -1072,6 +1118,8 @@ class Agent:
                         approved = False
                         if self.approval_callback is not None:
                             try:
+                                # ✅ 调用 approval_callback 回调函数，让用户决定是否允许工具调用
+                                # 这里的 approval_callback 是来自 cli.py 中的 request_tool_approval 函数
                                 approved = await self.approval_callback(
                                     function_name,
                                     arguments,
@@ -1196,6 +1244,7 @@ class Agent:
         print(f"\n{Colors.BRIGHT_YELLOW}⚠️  {error_msg}{Colors.RESET}")
         return error_msg
 
+    # ✅
     def get_history(self) -> list[Message]:
         """Get message history."""
         return self.render_for_provider().copy()

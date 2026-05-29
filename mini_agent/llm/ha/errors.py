@@ -1,3 +1,4 @@
+# ✅
 """Custom exceptions + error classification for the HA layer.
 
 Phase 2 introduces explicit exception types for every error class that
@@ -101,7 +102,9 @@ class ErrorCategory(str, Enum):
     CAPACITY = "capacity"
     UNKNOWN = "unknown"
 
-
+# 如果是全部重试失败后，返回最后一个异常
+# 否则返回原始异常
+# 剥掉 RetryExhaustedError 外壳，让分类器直接看到真实异常（如 RateLimitError），避免因重试包装导致分类降级为 UNKNOWN
 def _unwrap(exc: Exception) -> Exception:
     """Peel off known wrappers so classification sees the underlying error."""
     if isinstance(exc, RetryExhaustedError) and exc.last_exception is not None:
@@ -109,6 +112,7 @@ def _unwrap(exc: Exception) -> Exception:
     return exc
 
 
+# 多属性名探针：兼容各家 LLM SDK 对 HTTP 状态码的不同存储位置（直接属性或嵌套 response 对象），读不到时返回 None
 def _status_code_of(exc: Exception) -> int | None:
     """Best-effort extraction of an HTTP status code from SDK errors."""
     for attr in ("status_code", "status", "http_status", "code"):
@@ -134,12 +138,13 @@ CAPACITY_HINTS = (
     "max_tokens",
 )
 
-
+# ✅
+# 检查错误信息是否有上下文太长相关关键词
 def _looks_like_capacity(message: str) -> bool:
     lowered = message.lower()
     return any(hint in lowered for hint in CAPACITY_HINTS)
 
-
+# 把任意异常翻译成ErrorCategory -- 先认自定义类型 -- 再duck-typing兜底
 def classify_error(exc: Exception) -> ErrorCategory:
     """Classify an exception — custom types first, then SDK duck-typing.
 
@@ -151,6 +156,7 @@ def classify_error(exc: Exception) -> ErrorCategory:
     exc = _unwrap(exc)
 
     # Phase 2: custom exception types classify directly.
+    # 第一层--- 识别我们自己定义的异常 --- 直接返回
     if isinstance(exc, ContextOverflowError):
         return ErrorCategory.CAPACITY
     if isinstance(exc, BadRequestError):
@@ -164,6 +170,7 @@ def classify_error(exc: Exception) -> ErrorCategory:
     if isinstance(exc, TransientError):
         return ErrorCategory.TRANSIENT
 
+    # HTTP 状态码 -- 识别
     # Fallback: SDK-style duck typing.
     name = type(exc).__name__.lower()
     message = str(exc)
@@ -185,6 +192,7 @@ def classify_error(exc: Exception) -> ErrorCategory:
         if 400 <= status < 500:
             return ErrorCategory.REQUEST_MALFORMED
 
+    # 类名字符匹配
     if "authentication" in name or "permissiondenied" in name or "forbidden" in name:
         return ErrorCategory.AUTH
     if "ratelimit" in name:
@@ -206,7 +214,8 @@ def classify_error(exc: Exception) -> ErrorCategory:
 
     return ErrorCategory.UNKNOWN
 
-
+# 把SDK原生异常转为中立异常类 TransientError, RateLimitError, AuthError, NodeUnavailableError, BadRequestError, ContextOverflowError
+# client调用api失败时有SDK原生的异常 --- 这里把原生异常转为中立异常类
 def normalize_sdk_error(exc: Exception) -> Exception:
     """Translate an SDK exception into the nearest custom exception.
 
@@ -238,12 +247,12 @@ def normalize_sdk_error(exc: Exception) -> Exception:
     new_exc.__cause__ = exc
     return new_exc
 
-
+# 判断这个错误类别是否在同一节点重试
 def is_retryable(category: ErrorCategory) -> bool:
     """In-node retry eligibility (category-based, for logging/fallback)."""
     return category in (ErrorCategory.TRANSIENT, ErrorCategory.UNKNOWN)
 
-
+# 判断这个错误类别是否切换到下一个节点
 def is_node_switchable(category: ErrorCategory) -> bool:
     """Whether failing over to another node is appropriate.
 

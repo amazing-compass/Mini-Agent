@@ -1,3 +1,4 @@
+# ✅
 """Model router — selects a node, failover-orchestrates, and enforces the
 design's responsibility separation between agent (compression) and
 router (request-level budgeting + breaker).
@@ -55,7 +56,9 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
+# 请求开始时的回调 -- 告诉外部“我要发请求了，发给那个节点，是第几级failover”
 OnRequestStart = Callable[[ModelNode, int], None]
+# failover发生时的回调
 OnFailover = Callable[[ModelNode, ModelNode, Exception, ErrorCategory], None]
 
 # Pre-flight fits uses this as the minimum output headroom — a node that
@@ -69,6 +72,7 @@ class ModelRouter:
 
     SUPPORTED_STRATEGIES = ("priority",)
 
+    # ✅
     def __init__(
         self,
         pool: ModelPool,
@@ -102,6 +106,8 @@ class ModelRouter:
     # Phase 2 primary API: .call / .internal_call
     # ------------------------------------------------------------------
 
+    # ✅
+    # 只读返回优先级最高的节点 -- 给Agent启动时定价用
     def peek_primary_node(self) -> ModelNode | None:
         """Return the highest-priority enabled node, or None if pool is empty.
 
@@ -117,6 +123,8 @@ class ModelRouter:
             return None
         return min(enabled, key=lambda n: (-n.priority, n.node_id))
 
+    # ✅
+    # 业务请求主入口：三桶分类 → 同家族 failover → 跨家族 failover
     async def call(
         self,
         messages: list[Any],
@@ -246,6 +254,8 @@ class ModelRouter:
 
         raise AllNodesFailedError(attempts=attempts)
 
+    # ✅
+    # 遍历候选节点逐个发请求，处理各类异常 + 失败计数 + 熔断
     async def _try_candidates(
         self,
         candidates: list[ModelNode],
@@ -266,6 +276,8 @@ class ModelRouter:
         never cross-family retryable.
         """
         for idx, node in enumerate(candidates):
+            # enumerate 是 python 内置函数 -- 在for循环中同时拿到 序号 和 元素本身
+            # level --- 全局第几次尝试
             level = level_base + idx
             if self.on_request_start is not None:
                 try:
@@ -343,6 +355,8 @@ class ModelRouter:
 
         return None
 
+    # ✅
+    # 摘要专用通道：只选 is_serving 节点，单次试，不动熔断器
     async def internal_call(
         self,
         messages: list[Any],
@@ -389,6 +403,7 @@ class ModelRouter:
     # Phase 1 compatibility surface: .select_candidates / .execute
     # ------------------------------------------------------------------
 
+    # ❌ 过时代码 -- 不看
     def select_candidates(self) -> list[ModelNode]:
         """Phase 1 API — healthy-by-priority first, unhealthy-by-priority last.
 
@@ -404,6 +419,7 @@ class ModelRouter:
 
         return sorted(enabled, key=sort_key)
 
+    # ❌ 过时代码 -- 不看
     async def execute(
         self,
         fn: Callable[[ModelNode], Awaitable[T]],
@@ -495,7 +511,7 @@ class ModelRouter:
     # ------------------------------------------------------------------
     # helpers
     # ------------------------------------------------------------------
-
+    #failover 发生时安全调用外部回调（异常不中断主流程）
     def _notify_failover(
         self,
         ordered: list[ModelNode],
@@ -516,7 +532,7 @@ class ModelRouter:
     # ------------------------------------------------------------------
     # Phase 3: cross-protocol-family helpers (design §6)
     # ------------------------------------------------------------------
-
+    # 跨家族前深拷贝消息，剥 thinking/cache_control、修复孤儿 tool_calls
     def _prepare_messages_for_family(
         self,
         messages: list[Any],
@@ -660,6 +676,8 @@ class ModelRouter:
 
         return prepared
 
+    # ✅
+    # 跨家族能力门禁：目标节点必须 supports_tools（如有工具）
     def _is_capable_for(
         self,
         node: ModelNode,

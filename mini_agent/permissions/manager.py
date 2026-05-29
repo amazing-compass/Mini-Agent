@@ -72,6 +72,7 @@ class PermissionManager:
             list(rules) if rules is not None else list(DEFAULT_RULES)
         )
 
+    # ✅
     @staticmethod
     def _validate_mode(mode: PermissionMode) -> None:
         if mode not in VALID_MODES:
@@ -79,10 +80,12 @@ class PermissionManager:
                 f"Unknown mode: {mode!r}. Choose from {VALID_MODES}"
             )
 
+    # ✅
     @property
     def mode(self) -> PermissionMode:
         return self._mode
 
+    # ✅
     def set_mode(self, mode: PermissionMode) -> None:
         self._validate_mode(mode)
         self._mode = mode

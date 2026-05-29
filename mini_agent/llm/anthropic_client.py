@@ -1,3 +1,4 @@
+# ✅
 """Anthropic LLM client implementation."""
 
 import logging
@@ -55,6 +56,7 @@ class AnthropicClient(LLMClientBase):
             default_headers={"Authorization": f"Bearer {api_key}"},
         )
 
+# 把准备好的参数直接扔给Anthropic SDK 执行API调用
     async def _make_api_request(
         self,
         system_message: Any,
@@ -103,6 +105,8 @@ class AnthropicClient(LLMClientBase):
         except Exception as exc:
             raise normalize_sdk_error(exc) from exc
 
+# ✅
+# 把内部工具格式转成Anthropic格式的dict 可选： 在最后一个工具上打BP #3
     def _convert_tools(
         self,
         tools: list[Any],
@@ -165,6 +169,8 @@ class AnthropicClient(LLMClientBase):
                 result[-1] = {**last, "cache_control": {"type": "ephemeral"}}
         return result
 
+# ✅
+# 把内部Message 列表翻译成Anthropic格式的dict 列表
     def _convert_messages(
         self,
         messages: list[Message],
@@ -289,6 +295,7 @@ class AnthropicClient(LLMClientBase):
 
         return system_message, api_messages
 
+# 在最后一条 assistant 消息上打缓存 BP #4
     @staticmethod
     def _attach_bp4(api_messages: list[dict[str, Any]]) -> None:
         """Attach BP #4 to the last stable assistant message in-place.
@@ -338,6 +345,8 @@ class AnthropicClient(LLMClientBase):
                 api_messages[last_asst_idx]["content"] = new_content
                 return
 
+# ✅
+# 准备请求参数 把内部Message 列表和工具列表转成Anthropic格式的dict 列表
     def _prepare_request(
         self,
         messages: list[Message],
@@ -381,6 +390,8 @@ class AnthropicClient(LLMClientBase):
             "tools": api_tools,
         }
 
+# ✅
+# 解析Anthropic API响应 转换成内部LLMResponse格式
     def _parse_response(self, response: anthropic.types.Message) -> LLMResponse:
         """Parse Anthropic response into LLMResponse.
 
@@ -425,7 +436,11 @@ class AnthropicClient(LLMClientBase):
         usage = None
         if hasattr(response, "usage") and response.usage:
             usage_obj = response.usage
-            output_tokens = getattr(usage_obj, "output_tokens", 0) or 0
+            output_tokens = (
+                getattr(usage_obj, "output_tokens", 0)       # Anthropic
+                or getattr(usage_obj, "completion_tokens", 0) # DeepSeek / OpenAI
+                or 0
+            )
 
             deepseek_hit = getattr(usage_obj, "prompt_cache_hit_tokens", 0) or 0
             deepseek_miss = getattr(usage_obj, "prompt_cache_miss_tokens", 0) or 0
@@ -457,10 +472,13 @@ class AnthropicClient(LLMClientBase):
             usage=usage,
         )
 
+# 主入口 所有外部调用者只调这一个方法
     async def generate(
         self,
         messages: list[Message],
         tools: list[Any] | None = None,
+
+        #  * 强制后续参数必须使用关键字传入
         *,
         max_tokens: int | None = None,
         attach_message_bp: bool = True,
@@ -469,6 +487,7 @@ class AnthropicClient(LLMClientBase):
         """Generate response from Anthropic LLM.
 
         Args:
+
             messages: List of conversation messages
             tools: Optional list of available tools
             max_tokens: Output budget for this call. When None the client
@@ -503,6 +522,7 @@ class AnthropicClient(LLMClientBase):
         )
 
         if self.retry_config.enabled:
+            # 使用retry装饰器 包装_make_api_request 函数 实现重试逻辑
             retry_decorator = async_retry(
                 config=self.retry_config,
                 on_retry=self.retry_callback,
@@ -530,8 +550,10 @@ class AnthropicClient(LLMClientBase):
 # Module-level helpers — cache_control strip utilities. Placed at module
 # scope so they can be unit-tested without instantiating the SDK client.
 # ---------------------------------------------------------------------
+# ✅
+# 模块级工具函数
 
-
+# 从system 消息里删掉所有cache_control标记
 def _strip_cache_control_from_system(system_message: Any) -> Any:
     """Remove Anthropic ``cache_control`` markers from a system payload.
 
@@ -548,7 +570,7 @@ def _strip_cache_control_from_system(system_message: Any) -> Any:
         return stripped
     return system_message
 
-
+# 从消息列表的每个内容块里删掉 cache_control 字段
 def _strip_cache_control_from_messages(
     api_messages: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -563,7 +585,7 @@ def _strip_cache_control_from_messages(
             ]
     return api_messages
 
-
+# 从工具定义列表里删掉 cache_control 字段
 def _strip_cache_control_from_tools(
     api_tools: list[dict[str, Any]] | None,
 ) -> list[dict[str, Any]] | None:

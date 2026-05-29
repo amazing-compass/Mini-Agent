@@ -1,5 +1,8 @@
+# ✅ 
 """Base class for LLM clients."""
 
+# ABC -- 抽象基类  abstract base class
+# ABC -- 作用就是强制规定子类必须实现哪些方法
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -47,6 +50,7 @@ class LLMClientBase(ABC):
         self.default_max_tokens = default_max_tokens
 
         # Callback for tracking retry count
+        # 触发重试时调用的通知函数
         self.retry_callback = None
         # Phase 3 removed the `should_retry` double-insurance: the default
         # `retryable_exceptions=(TransientError,)` is narrow enough on its
@@ -54,6 +58,7 @@ class LLMClientBase(ABC):
         # anything reaching the retry decorator is already classified.
         # The attribute is kept on the instance so external callers that
         # want an extra classifier gate can still inject one.
+        # 重试前的否决门   在返回false时，不进行重试 比如认证失败（401）、请求格式错误这类 --- 重试10次也没用 直接报错
         self.should_retry = None
 
     @abstractmethod

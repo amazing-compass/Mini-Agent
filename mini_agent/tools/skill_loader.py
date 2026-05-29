@@ -1,3 +1,4 @@
+# ✅
 """
 Skill Loader - Load Claude Skills
 
@@ -11,7 +12,10 @@ from typing import Dict, List, Optional
 
 import yaml
 
-
+# datacalss -- 装饰器
+# 自动生成 init 构造函数
+# repr -- print(skill) 显示有意义的内容
+#  eq --- 按字段值比较
 @dataclass
 class Skill:
     """Skill data structure"""
@@ -77,10 +81,15 @@ class SkillLoader:
                 print(f"⚠️  {skill_path} missing YAML frontmatter")
                 return None
 
+            # 正则匹配分成两部分
+            # 第一部分是 frontmatter
+            # 第二部分是 skill content
             frontmatter_text = frontmatter_match.group(1)
             skill_content = frontmatter_match.group(2).strip()
 
             # Parse YAML
+            # 解析 YAML 格式的 frontmatter 
+            # 返回一个字典
             try:
                 frontmatter = yaml.safe_load(frontmatter_text)
             except yaml.YAMLError as e:
@@ -116,6 +125,7 @@ class SkillLoader:
             print(f"❌ Failed to load skill ({skill_path}): {e}")
             return None
 
+    # 处理 skill 正文中的相对路径换成绝对路径
     def _process_skill_paths(self, content: str, skill_dir: Path) -> str:
         """
         Process skill content to replace relative paths with absolute paths.

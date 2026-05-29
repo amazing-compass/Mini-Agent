@@ -1,3 +1,4 @@
+# ✅
 """
 Skill Tool - Tool for Agent to load Skills on-demand
 
@@ -53,7 +54,7 @@ class GetSkillTool(Tool):
         result = skill.to_prompt()
         return ToolResult(success=True, content=result)
 
-
+# Agent中加载 GetSkillTool --- 实际是通过工厂函数
 def create_skill_tools(
     skills_dir: str = "./skills",
 ) -> tuple[List[Tool], Optional[SkillLoader]]:

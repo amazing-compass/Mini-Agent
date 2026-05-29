@@ -1,10 +1,11 @@
+# ✅
 """MCP tool loader with real MCP client integration and timeout handling."""
 
 import asyncio
 import json
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path 
 from typing import Any, Literal
 
 from mcp import ClientSession, StdioServerParameters
@@ -15,9 +16,16 @@ from mcp.client.streamable_http import streamablehttp_client
 from .base import Tool, ToolResult
 
 # Connection type aliases
+# Literal --- 枚举类型
+# stdio --- 标准输入输出
+# sse --- 服务器发送事件
+# http --- 超文本传输协议
+# streamable_http --- 流式超文本传输协议
+# 本地 MCP 一般使用 stdio
+# 远程 MCP 一般使用 streamable_http --- URL 有值自动推断
 ConnectionType = Literal["stdio", "sse", "http", "streamable_http"]
 
-
+# MCP 三类超时配置：建立连接 / 工具执行 / SSE 读取
 @dataclass
 class MCPTimeoutConfig:
     """MCP timeout configuration."""
@@ -30,7 +38,7 @@ class MCPTimeoutConfig:
 # Global default timeout config
 _default_timeout_config = MCPTimeoutConfig()
 
-
+# 修改全局默认超时
 def set_mcp_timeout_config(
     connect_timeout: float | None = None,
     execute_timeout: float | None = None,
@@ -43,6 +51,7 @@ def set_mcp_timeout_config(
         execute_timeout: Tool execution timeout in seconds
         sse_read_timeout: SSE read timeout in seconds
     """
+    # global --- 告诉函数我要修改模块级变量
     global _default_timeout_config
     if connect_timeout is not None:
         _default_timeout_config.connect_timeout = connect_timeout
@@ -51,12 +60,12 @@ def set_mcp_timeout_config(
     if sse_read_timeout is not None:
         _default_timeout_config.sse_read_timeout = sse_read_timeout
 
-
+# 读取全局默认超时
 def get_mcp_timeout_config() -> MCPTimeoutConfig:
     """Get current MCP timeout configuration."""
     return _default_timeout_config
 
-
+# 把远端 MCP 工具包装成本地 Tool 接口，带超时保护
 class MCPTool(Tool):
     """Wrapper for MCP tools with timeout handling."""
 
@@ -65,6 +74,10 @@ class MCPTool(Tool):
         name: str,
         description: str,
         parameters: dict[str, Any],
+        # ClientSession -- MCP库的客户端会话对象
+        # ClientSession 持有两个流 
+        # read_stream -- 从MCP Server 读数据
+        # write_stream -- 向MCP Server 写数据
         session: ClientSession,
         execute_timeout: float | None = None,
     ):
@@ -86,13 +99,24 @@ class MCPTool(Tool):
     def parameters(self) -> dict[str, Any]:
         return self._parameters
 
+    # kwargs --  收集任意多个参数放入字典
+    # 可以让所有工具共享一个签名
     async def execute(self, **kwargs) -> ToolResult:
         """Execute MCP tool via the session with timeout protection."""
         timeout = self._execute_timeout or _default_timeout_config.execute_timeout
 
         try:
+            # 线程在运行事件循环
+            # 事件循环在这个线程里调度execute和call_tool
+            # 当线程里事件循环调度到call_tool时，会暂停execute的执行，直到call_tool完成
             # Wrap call_tool with timeout
             async with asyncio.timeout(timeout):
+                # 1. call_tool 把参数序列化成JSON-RPC格式
+                # 2. 写入write_stream
+                # 3. 挂起当前线程，等待MCP Server 响应
+                # 4. 从read_stream读取响应
+                # 5. 反序列化成Python对象
+                # 6. 返回结果
                 result = await self._session.call_tool(self._name, arguments=kwargs)
 
             # MCP tool results are a list of content items
@@ -118,7 +142,7 @@ class MCPTool(Tool):
         except Exception as e:
             return ToolResult(success=False, content="", error=f"MCP tool execution failed: {str(e)}")
 
-
+# 单个 MCP server 的连接生命周期：连接 → 列举工具 → 清理
 class MCPServerConnection:
     """Manages connection to a single MCP server (STDIO or URL-based) with timeout handling."""
 
@@ -127,12 +151,12 @@ class MCPServerConnection:
         name: str,
         connection_type: ConnectionType = "stdio",
         # STDIO params
-        command: str | None = None,
-        args: list[str] | None = None,
-        env: dict[str, str] | None = None,
+        command: str | None = None,    # 要执行的命令 --- 比如 “npx” “python”
+        args: list[str] | None = None,      
+        env: dict[str, str] | None = None,   
         # URL-based params
         url: str | None = None,
-        headers: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,   # HTTP请求头 比如{"Authorization": "Bearer token"}
         # Timeout overrides (per-server)
         connect_timeout: float | None = None,
         execute_timeout: float | None = None,
@@ -173,6 +197,7 @@ class MCPServerConnection:
         connect_timeout = self._get_connect_timeout()
 
         try:
+            # AsyncExitStack -- 动态收集async with的容器 在运行时决定管理哪些资源
             self.exit_stack = AsyncExitStack()
 
             # Wrap connection with timeout
@@ -188,6 +213,9 @@ class MCPServerConnection:
                 session = await self.exit_stack.enter_async_context(ClientSession(read_stream, write_stream))
                 self.session = session
 
+                # 以下两步 --- 重点参考AI Xmind笔记
+                # 1. 建立MCP 协议
+                # 2. 列举工具 
                 # Initialize the session
                 await session.initialize()
 
@@ -195,6 +223,7 @@ class MCPServerConnection:
                 tools_list = await session.list_tools()
 
             # Wrap each tool with execute timeout
+            # 实际上一个MCP server 可以有多个工具
             execute_timeout = self._get_execute_timeout()
             for tool in tools_list.tools:
                 parameters = tool.inputSchema if hasattr(tool, "inputSchema") else {}
@@ -230,6 +259,8 @@ class MCPServerConnection:
 
             traceback.print_exc()
             return False
+
+    # 以下三个函数 --- 建立通信通道 -- 返回（read_stream, write_stream）
 
     async def _connect_stdio(self):
         """Connect via STDIO transport."""
@@ -300,7 +331,7 @@ class MCPServerConnection:
 # Global connections registry
 _mcp_connections: list[MCPServerConnection] = []
 
-
+# 推断连接类型：显式 type 优先，否则按 url 自动判断
 def _determine_connection_type(server_config: dict) -> ConnectionType:
     """Determine connection type from server config."""
     explicit_type = server_config.get("type", "").lower()
@@ -311,7 +342,7 @@ def _determine_connection_type(server_config: dict) -> ConnectionType:
         return "streamable_http"
     return "stdio"
 
-
+# 解析配置路径，找不到 mcp.json 时回退到 mcp-example.json
 def _resolve_mcp_config_path(config_path: str) -> Path | None:
     """
     Resolve MCP config path with fallback logic.
@@ -342,7 +373,7 @@ def _resolve_mcp_config_path(config_path: str) -> Path | None:
 
     return None
 
-
+# 主入口：读配置 → 连接所有 server → 汇总返回工具列表
 async def load_mcp_tools_async(config_path: str = "mcp.json") -> list[Tool]:
     """
     Load MCP tools from config file.
@@ -440,7 +471,7 @@ async def load_mcp_tools_async(config_path: str = "mcp.json") -> list[Tool]:
         traceback.print_exc()
         return []
 
-
+# Agent 退出时统一清理所有连接
 async def cleanup_mcp_connections():
     """Clean up all MCP connections."""
     global _mcp_connections

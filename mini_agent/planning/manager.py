@@ -1,3 +1,4 @@
+
 """Session-level plan manager.
 
 Wraps :class:`PlanningState` with validation, rendering, and a stale-plan
@@ -32,7 +33,7 @@ class PlanningManager:
     # ------------------------------------------------------------------
     # Mutation
     # ------------------------------------------------------------------
-
+    # 更新整份计划（核心写入） 
     def update(self, items: list[Any]) -> str:
         """Replace the plan with a new set of items.
 
@@ -94,6 +95,7 @@ class PlanningManager:
         self.state.rounds_since_update = 0
         return self.render()
 
+    # ✅清空整份计划（直接换一个新的对象）
     def clear(self) -> None:
         """Drop the entire plan. Used by ``/clear``."""
         self.state = PlanningState()
@@ -101,7 +103,7 @@ class PlanningManager:
     # ------------------------------------------------------------------
     # Round tracking
     # ------------------------------------------------------------------
-
+    # ✅
     def note_round_without_update(self) -> None:
         """Increment the stale counter.
 
@@ -111,9 +113,11 @@ class PlanningManager:
         if self.state.items:
             self.state.rounds_since_update += 1
 
+    # ✅
     def reset_round_counter(self) -> None:
         self.state.rounds_since_update = 0
 
+    # 计划「过期」提醒文案 ✅
     def reminder(self) -> str | None:
         """Return a reminder string when the plan has gone stale, else None."""
         if not self.state.items:
@@ -130,7 +134,7 @@ class PlanningManager:
     # ------------------------------------------------------------------
     # Rendering
     # ------------------------------------------------------------------
-
+    # 紧凑版计划文本（无标题、无提醒）
     def render(self) -> str:
         """Compact plan rendering (no heading, no reminder)."""
         if not self.state.items:
@@ -148,6 +152,7 @@ class PlanningManager:
             lines.append(f"  {marker} {label}")
         return "\n".join(lines)
 
+    # 完整版计划文本（有标题、有提醒）
     def render_for_prompt(self) -> str:
         """Full prompt section (heading + plan + optional stale reminder).
 

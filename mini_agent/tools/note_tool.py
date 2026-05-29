@@ -1,3 +1,4 @@
+# ✅
 """Session Note Tool - Let agent record and recall important information.
 
 This tool allows the agent to:
@@ -13,6 +14,7 @@ from typing import Any
 
 from .base import Tool, ToolResult
 
+# ✅
 
 class SessionNoteTool(Tool):
     """Tool for recording and recalling session notes.

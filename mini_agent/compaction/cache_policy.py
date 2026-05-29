@@ -1,3 +1,4 @@
+# ✅
 """Per-(protocol_family, model) pricing lookup for the DP compaction policy.
 
 The price table here is illustrative and pegged to 2026-05 reference
@@ -23,10 +24,14 @@ from .models import ModelPricing
 if TYPE_CHECKING:
     from ..llm.ha.models import ModelNode
 
+# 模型价格表 + 查价器
+
 
 # Reference prices as of 2026-05 — see docstring for the source-of-truth
 # caveat. Keep entries grouped by protocol_family so it's obvious where
 # a new model needs to land.
+# K - V
+# K 是 (protocol_family, model) 元组，V 是 ModelPricing 对象
 _PRICING_TABLE: dict[tuple[str, str], ModelPricing] = {
     # DeepSeek V4 (automatic Context Caching; no explicit cache_control).
     # 2026-05 promo: hit / miss / output = 0.003625 / 0.435 / 0.87 USD/1M.
@@ -56,7 +61,8 @@ _PRICING_TABLE: dict[tuple[str, str], ModelPricing] = {
 # which is the only honest thing to say for an unknown provider.
 _DEFAULT_PRICING = ModelPricing(3.0, 3.0, 3.0, 15.0)
 
-
+# CachePolicy 查价器
+# 输入一个 ModelNode 对象，输出一个 ModelPricing 对象
 class CachePolicy:
     """Lookup helper for ``ModelPricing`` keyed by node identity."""
 

@@ -1,3 +1,4 @@
+# ✅
 """DP-driven compaction decision policy.
 
 The policy is a pure function over :class:`CompactionSnapshot`:
@@ -39,19 +40,20 @@ class CompactionPolicy:
     """Stateless DP policy. Safe to share across requests."""
 
     # ---- Tunable constants (kept conservative; see §3.4) ----------------
-    BASELINE_E = 20           # expected remaining user rounds (anchor)
-    DEFAULT_L = 5             # default LLM calls per user round
-    BETA = 0.3                # information-loss weight
-    R_DECAY = 0.9             # geometric decay for repeated compactions
-    SUMMARY_SIZE = 500        # token budget for the summary output
-    L_INSTR = 200             # token cost of SUMMARY_INSTRUCTION
-    MIN_DROP_TOKENS = 1000    # don't bother compacting tiny prefixes
-    HARD_THRESHOLD = 0.90     # 90% of max_context → forced
+    # 全部是类级常量
+    BASELINE_E = 20           # 预期剩余用户轮次的锚点值
+    DEFAULT_L = 5             # 每个用户轮次默认的 LLM 调用次数
+    BETA = 0.3                # 信息损失权重（公式里 distortion 项的系数）
+    R_DECAY = 0.9             # 重复压缩时的几何衰减因子
+    SUMMARY_SIZE = 500        # 摘要输出的 token 预算
+    L_INSTR = 200             # SUMMARY_INSTRUCTION 的 token 成本
+    MIN_DROP_TOKENS = 1000    # 小于这个量不值得压缩，跳过
+    HARD_THRESHOLD = 0.90     # 上下文超过 90% 强制压缩
 
     def __init__(self) -> None:
         # Encoder is cached on the instance so repeated calls don't
         # re-instantiate cl100k_base. tiktoken is happy to be reused.
-        self._encoder = None
+        self._encoder = None   # 懒加载的 tiktoken 编码器
 
     # ------------------------------------------------------------------
     # Public API
@@ -168,6 +170,8 @@ class CompactionPolicy:
             forced=True,
         )
 
+    # ✅
+    # 找到所有 role == "user" 的位置
     @staticmethod
     def _user_round_boundaries(messages: list["Message"]) -> list[int]:
         """Indices in ``messages`` where each user-round starts.
@@ -179,6 +183,7 @@ class CompactionPolicy:
         """
         return [i for i, m in enumerate(messages) if m.role == "user"]
 
+    # ✅
     def _encoder_get(self):
         enc = self._encoder
         if enc is None:
@@ -186,6 +191,7 @@ class CompactionPolicy:
             self._encoder = enc
         return enc
 
+    # ✅
     def _encode_len(self, value: object) -> int:
         """Best-effort token length for v1 DP estimates."""
         if value is None:
@@ -216,6 +222,7 @@ class CompactionPolicy:
             total += self._encode_len(msg.name)
         return total
 
+    # ✅不压缩
     @staticmethod
     def _noop(reason: str) -> CompactionDecision:
         return CompactionDecision(

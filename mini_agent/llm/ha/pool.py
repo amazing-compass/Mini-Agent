@@ -1,3 +1,4 @@
+# ✅
 """Model node pool — the authoritative list of candidate endpoints.
 
 Phase 2 extends the Phase 1 ModelPool with a per-node `LLMClientBase`
@@ -25,6 +26,7 @@ class ModelPool:
     def __init__(
         self,
         nodes: list[ModelNode],
+        # build_client -- 可选工厂函数 -- 给定一个ModelNode -- 造出对应的SDK 客户端
         build_client: Callable[[ModelNode], "LLMClientBase"] | None = None,
     ) -> None:
         if not nodes:

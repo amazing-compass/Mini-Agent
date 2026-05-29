@@ -1,3 +1,4 @@
+# ✅
 """Per-request token budgeting (read-only).
 
 `TokenBudget` lives on the router's side of the agent/router boundary —
@@ -29,10 +30,11 @@ except Exception:  # pragma: no cover — tiktoken missing/broken
 # Per-message overhead (role header, separators, delimiters). Matches the
 # figure the agent uses for its own pre-compression estimate so the two
 # layers don't disagree wildly.
+# 比如消息中{} -- 也是占用token的 -- 只是一个估计值
 _MESSAGE_OVERHEAD_TOKENS = 4
 _TOOL_OVERHEAD_TOKENS = 16
 
-
+# 计算str文本的token长度
 def _encode_len(text: str) -> int:
     if not text:
         return 0
@@ -41,7 +43,8 @@ def _encode_len(text: str) -> int:
         return max(1, int(len(text) / 2.5))
     return len(_ENCODER.encode(text))
 
-
+# 计算obj的token长度 -- 如果是str则调用_encode_len计算 -- 否则用json.dumps序列化成str再调用_encode_len计算
+# obj 先序列化成str再计算token长度
 def _token_len_of(obj: Any) -> int:
     """Best-effort token count for an arbitrary JSON-serializable object."""
     if obj is None:
